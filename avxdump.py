@@ -24,6 +24,13 @@ except ImportError:
     print("Error: pyelftools not installed. Install with: pip install pyelftools")
     sys.exit(1)
 
+try:
+    import capstone
+    from capstone import CS_ARCH_X86, CS_MODE_64, CS_OPT_DETAIL
+except ImportError:
+    print("Error: Capstone not installed. Install with: pip install capstone")
+    sys.exit(1)
+
 
 class BinaryAnalyzer:
     """Analyzes ELF binaries and their dependencies."""
@@ -32,6 +39,11 @@ class BinaryAnalyzer:
         self.binary_path = Path(binary_path)
         self.binary_file = None
         self.libraries = {}  # Dict[str, Dict] - library name -> info dict
+        self.simd_instructions = {}  # Dict[str, List] - module -> list of SIMD instructions
+        
+        # Initialize Capstone disassembler
+        self.cs = capstone.Cs(CS_ARCH_X86, CS_MODE_64)
+        self.cs.detail = True  # Enable detailed instruction information
         
     def validate_binary(self) -> bool:
         """Validate that the binary exists and is a valid ELF file."""
@@ -210,13 +222,193 @@ class BinaryAnalyzer:
         
         return len(self.libraries) > 0
     
+    def get_executable_sections(self, elf_file) -> List[Tuple[int, int, str]]:
+        """Get executable sections from an ELF file."""
+        sections = []
+        
+        for section in elf_file.iter_sections():
+            if section['sh_flags'] & 0x4:  # SHF_EXECINSTR flag
+                sections.append((
+                    section['sh_addr'],  # Virtual address
+                    section['sh_size'],   # Size
+                    section.name         # Section name
+                ))
+        
+        return sections
+    
+    def is_simd_instruction(self, instruction) -> bool:
+        """Check if an instruction is a SIMD instruction using Capstone groups."""
+        # Capstone groups for SIMD instructions
+        simd_groups = {
+            capstone.x86.X86_GRP_SSE1,     # SSE
+            capstone.x86.X86_GRP_SSE2,     # SSE2
+            capstone.x86.X86_GRP_SSE3,     # SSE3
+            capstone.x86.X86_GRP_SSE41,    # SSE4.1
+            capstone.x86.X86_GRP_SSE42,    # SSE4.2
+            capstone.x86.X86_GRP_AVX,      # AVX
+            capstone.x86.X86_GRP_AVX2,     # AVX2
+            capstone.x86.X86_GRP_AVX512,   # AVX512
+            capstone.x86.X86_GRP_FMA,      # FMA
+            capstone.x86.X86_GRP_F16C,     # F16C
+        }
+        
+        # Check if instruction belongs to any SIMD group
+        for group in instruction.groups:
+            if group in simd_groups:
+                return True
+        
+        return False
+    
+    def extract_register_info(self, instruction) -> Tuple[List[str], List[str]]:
+        """Extract read and written registers from an instruction."""
+        regs_read = []
+        regs_write = []
+        
+        # Use the proper Capstone API: regs_access() method
+        try:
+            regs_read_ids, regs_write_ids = instruction.regs_access()
+            
+            # Convert register IDs to names
+            for reg_id in regs_read_ids:
+                reg_name = self.cs.reg_name(reg_id)
+                if reg_name:
+                    regs_read.append(reg_name)
+            
+            for reg_id in regs_write_ids:
+                reg_name = self.cs.reg_name(reg_id)
+                if reg_name:
+                    regs_write.append(reg_name)
+                    
+        except Exception as e:
+            # Fallback to manual extraction if regs_access() fails
+            print(f"Warning: regs_access() failed, using fallback: {e}")
+            regs_read, regs_write = self._extract_registers_fallback(instruction)
+        
+        return regs_read, regs_write
+    
+    def _extract_registers_fallback(self, instruction) -> Tuple[List[str], List[str]]:
+        """Fallback method for register extraction using operand access flags."""
+        regs_read_set = set()
+        regs_write_set = set()
+        
+        # Import Capstone constants
+        from capstone import CS_AC_READ, CS_AC_WRITE, CS_OP_REG, CS_OP_MEM
+        
+        for op in instruction.operands:
+            if op.access & CS_AC_READ:
+                # Operand is read - check if it's a register or memory
+                if op.type == CS_OP_REG:
+                    reg_id = op.value.reg
+                    regs_read_set.add(reg_id)
+                elif op.type == CS_OP_MEM:
+                    # Memory operand: base/index registers are read
+                    mem = op.value.mem
+                    if mem.base != 0:
+                        regs_read_set.add(mem.base)
+                    if mem.index != 0:
+                        regs_read_set.add(mem.index)
+            
+            if op.access & CS_AC_WRITE:
+                # Operand is written - check if it's a register or memory
+                if op.type == CS_OP_REG:
+                    reg_id = op.value.reg
+                    regs_write_set.add(reg_id)
+                elif op.type == CS_OP_MEM:
+                    # Memory destination: base/index registers are read (not written)
+                    mem = op.value.mem
+                    if mem.base != 0:
+                        regs_read_set.add(mem.base)
+                    if mem.index != 0:
+                        regs_read_set.add(mem.index)
+        
+        # Convert register IDs to names
+        regs_read = []
+        regs_write = []
+        
+        for reg_id in regs_read_set:
+            reg_name = self.cs.reg_name(reg_id)
+            if reg_name:
+                regs_read.append(reg_name)
+        
+        for reg_id in regs_write_set:
+            reg_name = self.cs.reg_name(reg_id)
+            if reg_name:
+                regs_write.append(reg_name)
+        
+        return regs_read, regs_write
+    
+    def disassemble_module(self, module_path: str, module_info: Dict) -> List[Dict]:
+        """Disassemble a module and find SIMD instructions."""
+        simd_instructions = []
+        
+        try:
+            with open(module_path, 'rb') as f:
+                elf_file = ELFFile(f)
+                
+                # Get executable sections
+                sections = self.get_executable_sections(elf_file)
+                
+                if not sections:
+                    print(f"Warning: No executable sections found in {module_path}")
+                    return simd_instructions
+                
+                print(f"Disassembling {module_path}...")
+                
+                for section_addr, section_size, section_name in sections:
+                    # Read section data
+                    section = elf_file.get_section_by_name(section_name)
+                    if not section:
+                        continue
+                    
+                    section_data = section.data()
+                    
+                    # Disassemble the section
+                    for instruction in self.cs.disasm(section_data, section_addr):
+                        if self.is_simd_instruction(instruction):
+                            regs_read, regs_write = self.extract_register_info(instruction)
+                            
+                            simd_instruction = {
+                                'address': instruction.address,
+                                'mnemonic': instruction.mnemonic,
+                                'operands': instruction.op_str,
+                                'opcode': instruction.bytes.hex(),
+                                'regs_read': regs_read,
+                                'regs_write': regs_write,
+                                'section': section_name,
+                                'size': instruction.size
+                            }
+                            
+                            simd_instructions.append(simd_instruction)
+                
+                print(f"Found {len(simd_instructions)} SIMD instructions in {module_path}")
+                
+        except Exception as e:
+            print(f"Error disassembling {module_path}: {e}")
+        
+        return simd_instructions
+    
+    def analyze_simd_instructions(self) -> bool:
+        """Analyze SIMD instructions in all modules."""
+        print("\n=== Analyzing SIMD Instructions ===")
+        
+        for module_path, module_info in self.libraries.items():
+            simd_instructions = self.disassemble_module(module_path, module_info)
+            self.simd_instructions[module_path] = simd_instructions
+        
+        total_simd = sum(len(instructions) for instructions in self.simd_instructions.values())
+        print(f"Total SIMD instructions found: {total_simd}")
+        
+        return total_simd > 0
+    
     def generate_metadata(self) -> Dict:
         """Generate metadata for runtime reconstruction of AVX sessions."""
         metadata = {
             'modules': {},
+            'simd_instructions': {},
             'analysis_info': {
                 'binary_path': str(self.binary_path),
                 'total_modules': len(self.libraries),
+                'total_simd_instructions': sum(len(instructions) for instructions in self.simd_instructions.values()),
                 'addressing_mode': 'relative',  # All addresses are relative to module base
                 'note': 'All addresses are relative to module base. Runtime must add actual base addresses from /proc/pid/maps.'
             }
@@ -239,6 +431,11 @@ class BinaryAnalyzer:
             
             metadata['modules'][module_key] = module_info
         
+        # Add SIMD instructions for each module
+        for module_path, simd_instructions in self.simd_instructions.items():
+            module_key = os.path.basename(module_path)
+            metadata['simd_instructions'][module_key] = simd_instructions
+        
         return metadata
     
     def save_metadata(self, output_file: str = None) -> str:
@@ -246,7 +443,8 @@ class BinaryAnalyzer:
         import json
         
         if output_file is None:
-            output_file = f"{self.binary_path}.avxdump.json"
+            # Use just the filename to avoid permission issues
+            output_file = f"{self.binary_path.name}.avxdump.json"
         
         metadata = self.generate_metadata()
         
@@ -257,15 +455,20 @@ class BinaryAnalyzer:
         return output_file
     
     def print_summary(self):
-        """Print a summary of discovered modules."""
+        """Print a summary of discovered modules and SIMD instructions."""
         print("\n=== Analysis Summary ===")
         print(f"Total modules discovered: {len(self.libraries)}")
+        
+        total_simd = sum(len(instructions) for instructions in self.simd_instructions.values())
+        print(f"Total SIMD instructions found: {total_simd}")
+        
         print("Note: All addresses are relative to module base for static analysis")
         print("Runtime reconstruction requires adding actual base addresses from /proc/pid/maps")
         print()
         
         for module_path, info in self.libraries.items():
             module_type = info['type']
+            simd_count = len(self.simd_instructions.get(module_path, []))
             
             if module_type == 'main_binary':
                 print(f"Main Binary: {module_path}")
@@ -278,6 +481,7 @@ class BinaryAnalyzer:
                 print(f"  Entry Point: 0x{info.get('entry_point', 0):x}")
             
             print(f"  Path: {info['path']}")
+            print(f"  SIMD Instructions: {simd_count}")
             print()
     
     def run_analysis(self, save_metadata: bool = True) -> bool:
@@ -293,6 +497,9 @@ class BinaryAnalyzer:
         if not self.analyze_dependencies():
             print("Error: Failed to analyze dependencies")
             return False
+        
+        if not self.analyze_simd_instructions():
+            print("Warning: No SIMD instructions found")
         
         self.print_summary()
         
