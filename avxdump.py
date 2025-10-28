@@ -703,40 +703,97 @@ class BinaryAnalyzer:
         if not simd_instructions:
             return sessions
         
+        # Calculate base offset once for the entire module
+        base_offset = self._calculate_base_offset(cfg_data)
+        
         # Group SIMD instructions by function
-        func_simd_instructions = self._group_simd_by_function(simd_instructions, cfg_data)
+        func_simd_instructions = self._group_simd_by_function(simd_instructions, cfg_data, base_offset)
         
         # Analyze each function
         for func_addr, func_simd_insns in func_simd_instructions.items():
             if not func_simd_insns:
                 continue
                 
-            func_sessions = self._analyze_function_liveness(func_addr, func_simd_insns, cfg_data)
+            func_sessions = self._analyze_function_liveness(func_addr, func_simd_insns, cfg_data, base_offset)
             sessions.extend(func_sessions)
         
         return sessions
     
-    def _group_simd_by_function(self, simd_instructions: List[Dict], cfg_data: Dict) -> Dict:
+    def _calculate_base_offset(self, cfg_data: Dict) -> int:
+        """Calculate base address offset for PIE binaries."""
+        base_offset = 0
+        
+        # Check basic blocks first (stored as dict: block_addr -> block_info)
+        basic_blocks = cfg_data.get('basic_blocks', {})
+        if basic_blocks:
+            first_block_addr = min(basic_blocks.keys())
+            if first_block_addr > 0x400000:  # PIE binary
+                base_offset = first_block_addr - 0x1000  # Assume .text starts at 0x1000
+                print(f"PIE binary detected, base offset: 0x{base_offset:x}")
+        
+        return base_offset
+    
+    def _group_simd_by_function(self, simd_instructions: List[Dict], cfg_data: Dict, base_offset: int) -> Dict:
         """Group SIMD instructions by function."""
         func_simd = {}
         
-        for simd_insn in simd_instructions:
-            insn_addr = simd_insn['address']
-            
-            # Find which function contains this instruction
-            for func_addr, func_info in cfg_data.get('functions', {}).items():
+        print(f"\n=== DEBUG: Grouping SIMD by Function ===")
+        print(f"SIMD instructions: {len(simd_instructions)}")
+        print(f"CFG data keys: {list(cfg_data.keys())}")
+        
+        functions = cfg_data.get('functions', [])
+        print(f"Functions type: {type(functions)}, count: {len(functions)}")
+        
+        if functions and isinstance(functions, list):
+            print(f"First function: {functions[0]}")
+        
+        # Debug address ranges
+        print(f"\nFirst 5 SIMD instruction addresses:")
+        for i, insn in enumerate(simd_instructions[:5]):
+            print(f"  {i}: 0x{insn['address']:08x}")
+        
+        if isinstance(functions, dict):
+            print(f"\nFirst 5 function address ranges:")
+            for i, (func_addr, func_info) in enumerate(list(functions.items())[:5]):
                 func_start = func_info['address']
                 func_end = func_start + func_info.get('size', 0)
-                
-                if func_start <= insn_addr < func_end:
-                    if func_addr not in func_simd:
-                        func_simd[func_addr] = []
-                    func_simd[func_addr].append(simd_insn)
-                    break
+                print(f"  {i}: 0x{func_start:08x} - 0x{func_end:08x}")
+        
+        for simd_insn in simd_instructions:
+            insn_addr = simd_insn['address'] + base_offset  # Normalize address
+            
+            # Find which function contains this instruction
+            if isinstance(functions, dict):
+                # Functions stored as dict
+                for func_addr, func_info in functions.items():
+                    func_start = func_info['address']
+                    func_end = func_start + func_info.get('size', 0)
+                    
+                    if func_start <= insn_addr < func_end:
+                        if func_addr not in func_simd:
+                            func_simd[func_addr] = []
+                        func_simd[func_addr].append(simd_insn)
+                        break
+            elif isinstance(functions, list):
+                # Functions stored as list
+                for func_info in functions:
+                    func_start = func_info['address']
+                    func_end = func_start + func_info.get('size', 0)
+                    
+                    if func_start <= insn_addr < func_end:
+                        func_addr = func_start
+                        if func_addr not in func_simd:
+                            func_simd[func_addr] = []
+                        func_simd[func_addr].append(simd_insn)
+                        break
+        
+        print(f"Functions with SIMD: {len(func_simd)}")
+        for func_addr, insns in func_simd.items():
+            print(f"  Function 0x{func_addr:x}: {len(insns)} SIMD instructions")
         
         return func_simd
     
-    def _analyze_function_liveness(self, func_addr: int, simd_instructions: List[Dict], cfg_data: Dict) -> List[Dict]:
+    def _analyze_function_liveness(self, func_addr: int, simd_instructions: List[Dict], cfg_data: Dict, base_offset: int) -> List[Dict]:
         """Analyze liveness for a single function."""
         sessions = []
         
@@ -751,15 +808,19 @@ class BinaryAnalyzer:
             return sessions
         
         # Perform liveness analysis
-        liveness_info = self._compute_liveness(simd_instructions, basic_blocks)
+        liveness_info = self._compute_liveness(simd_instructions, basic_blocks, base_offset)
         
         # Identify session boundaries
-        sessions = self._identify_session_boundaries(simd_instructions, liveness_info)
+        sessions = self._identify_session_boundaries(simd_instructions, liveness_info, base_offset)
         
         return sessions
     
-    def _compute_liveness(self, simd_instructions: List[Dict], basic_blocks: List[Dict]) -> Dict:
-        """Compute liveness information for SIMD registers using CFG-based analysis."""
+    def _compute_liveness(self, simd_instructions: List[Dict], basic_blocks: List[Dict], base_offset: int) -> Dict:
+        """Compute liveness information for SIMD registers using CFG-based analysis with function call handling."""
+        print(f"\n=== DEBUG: Starting Liveness Analysis ===")
+        print(f"SIMD instructions: {len(simd_instructions)}")
+        print(f"Basic blocks: {len(basic_blocks)}")
+        
         # Initialize liveness sets
         live_in = {}  # instruction -> set of live registers
         live_out = {}  # instruction -> set of live registers
@@ -773,13 +834,31 @@ class BinaryAnalyzer:
         
         # Initialize all instructions with empty live sets
         for insn in simd_instructions:
-            insn_addr = insn['address']
+            insn_addr = insn['address'] + base_offset  # Normalize address
             live_in[insn_addr] = set()
             live_out[insn_addr] = set()
+        
+        print(f"Initialized liveness sets for {len(simd_instructions)} instructions")
         
         # Build instruction-to-basic-block mapping
         insn_to_block = {}
         block_to_insns = {}
+        
+        print(f"\n=== DEBUG: Building CFG Mappings ===")
+        blocks_with_simd = 0
+        
+        # Debug basic block address ranges
+        print(f"First 5 basic block address ranges:")
+        for i, block in enumerate(basic_blocks[:5]):
+            block_addr = block['address']
+            block_size = block['size']
+            block_end = block_addr + block_size
+            print(f"  {i}: 0x{block_addr:08x} - 0x{block_end:08x}")
+        
+        # Debug SIMD instruction addresses (normalized)
+        print(f"\nFirst 5 SIMD instruction addresses (normalized):")
+        for i, insn in enumerate(simd_instructions[:5]):
+            print(f"  {i}: 0x{insn['address']:08x}")
         
         for block in basic_blocks:
             block_addr = block['address']
@@ -788,7 +867,7 @@ class BinaryAnalyzer:
             
             block_insns = []
             for insn in simd_instructions:
-                insn_addr = insn['address']
+                insn_addr = insn['address'] + base_offset  # Normalize address
                 if block_addr <= insn_addr < block_end:
                     insn_to_block[insn_addr] = block_addr
                     block_insns.append(insn)
@@ -796,21 +875,45 @@ class BinaryAnalyzer:
             # Sort instructions within block by address
             block_insns.sort(key=lambda x: x['address'])
             block_to_insns[block_addr] = block_insns
+            
+            if block_insns:
+                blocks_with_simd += 1
+                print(f"  Block 0x{block_addr:x}: {len(block_insns)} SIMD instructions")
+        
+        print(f"Blocks with SIMD instructions: {blocks_with_simd}/{len(basic_blocks)}")
         
         # Build CFG edges mapping
         block_edges = {}
+        total_edges = 0
         for block in basic_blocks:
             block_addr = block['address']
-            block_edges[block_addr] = block.get('successors', [])
+            successors = block.get('successors', [])
+            block_edges[block_addr] = successors
+            total_edges += len(successors)
         
-        # Perform CFG-based backward data-flow analysis
+        print(f"Total CFG edges: {total_edges}")
+        
+        # Detect function calls and model them
+        function_calls = self._detect_function_calls(simd_instructions, basic_blocks)
+        
+        # Detect function arguments (SIMD registers used without being loaded first)
+        function_args = self._detect_function_arguments(simd_instructions, basic_blocks)
+        
+        # Perform CFG-based backward data-flow analysis with function call handling
         changed = True
         iteration = 0
         max_iterations = 100  # Prevent infinite loops
         
+        print(f"\n=== DEBUG: Starting Liveness Iteration ===")
+        
         while changed and iteration < max_iterations:
             changed = False
             iteration += 1
+            
+            if iteration <= 3:  # Only show debug for first few iterations
+                print(f"\n--- Iteration {iteration} ---")
+            
+            instructions_changed = 0
             
             # Process basic blocks in reverse order
             for block_addr in reversed(sorted(block_to_insns.keys())):
@@ -820,7 +923,7 @@ class BinaryAnalyzer:
                 
                 # Process instructions within block in reverse order
                 for insn in reversed(block_insns):
-                    insn_addr = insn['address']
+                    insn_addr = insn['address'] + base_offset  # Normalize address
                     
                     # Get registers read and written by this instruction
                     regs_read = set(insn.get('regs_read', []))
@@ -830,12 +933,25 @@ class BinaryAnalyzer:
                     simd_regs_read = regs_read.intersection(simd_regs)
                     simd_regs_write = regs_write.intersection(simd_regs)
                     
+                    # Handle function calls specially
+                    if insn_addr in function_calls:
+                        call_info = function_calls[insn_addr]
+                        # Function calls read argument registers and write return registers
+                        simd_regs_read.update(call_info.get('args', set()))
+                        simd_regs_write.update(call_info.get('returns', set()))
+                    
+                    # Handle function arguments (registers used without being loaded first)
+                    if insn_addr in function_args:
+                        func_args = function_args[insn_addr]
+                        # These registers are live coming into the function
+                        simd_regs_read.update(func_args)
+                    
                     # Live-out: union of live-in sets of successors
                     old_live_out = live_out[insn_addr].copy()
                     live_out[insn_addr] = set()
                     
                     # Find successors of this instruction
-                    successors = self._get_instruction_successors(insn_addr, block_insns, block_edges, block_to_insns, insn_to_block)
+                    successors = self._get_instruction_successors(insn_addr, block_insns, block_edges, block_to_insns, insn_to_block, base_offset)
                     
                     for succ_addr in successors:
                         if succ_addr in live_in:
@@ -848,25 +964,148 @@ class BinaryAnalyzer:
                     # Check if anything changed
                     if live_in[insn_addr] != old_live_in or live_out[insn_addr] != old_live_out:
                         changed = True
+                        instructions_changed += 1
+                        
+                        if iteration <= 3 and instructions_changed <= 5:  # Show first few changes
+                            print(f"  Changed: 0x{insn_addr:x} {insn['mnemonic']} {insn['operands']}")
+                            print(f"    Live-in: {old_live_in} -> {live_in[insn_addr]}")
+                            print(f"    Live-out: {old_live_out} -> {live_out[insn_addr]}")
+                            print(f"    Read: {simd_regs_read}, Write: {simd_regs_write}")
+            
+            if iteration <= 3:
+                print(f"  Instructions changed: {instructions_changed}")
+        
+        print(f"\n=== DEBUG: Liveness Analysis Complete ===")
+        print(f"Total iterations: {iteration}")
+        print(f"Converged: {not changed}")
+        
+        # Show final liveness for first few instructions
+        print(f"\nFinal liveness for first 5 instructions:")
+        for i, insn in enumerate(simd_instructions[:5]):
+            insn_addr = insn['address'] + base_offset  # Normalize address
+            print(f"  0x{insn_addr:x} {insn['mnemonic']} {insn['operands']}")
+            print(f"    Live-in: {live_in[insn_addr]}")
+            print(f"    Live-out: {live_out[insn_addr]}")
         
         return {
             'live_in': live_in,
             'live_out': live_out,
             'simd_regs': simd_regs,
             'insn_to_block': insn_to_block,
-            'block_to_insns': block_to_insns
+            'block_to_insns': block_to_insns,
+            'function_calls': function_calls,
+            'function_args': function_args
         }
+    
+    def _detect_function_calls(self, simd_instructions: List[Dict], basic_blocks: List[Dict]) -> Dict:
+        """Detect function call instructions and model their SIMD register effects."""
+        function_calls = {}
+        
+        # Get all instructions (not just SIMD ones) to find call instructions
+        all_instructions = []
+        
+        # Read the entire .text section to find all instructions
+        try:
+            code_section = self.elf_file.get_section_by_name('.text')
+            if not code_section:
+                return function_calls
+            
+            code = code_section.data()
+            
+            # Disassemble the entire .text section
+            for insn in self.cs.disasm(code, 0x401000):  # Start at typical static binary base
+                all_instructions.append({
+                    'address': insn.address,
+                    'mnemonic': insn.mnemonic,
+                    'operands': insn.op_str,
+                    'regs_read': [self.cs.reg_name(reg) for reg in insn.regs_read] if insn.regs_read else [],
+                    'regs_write': [self.cs.reg_name(reg) for reg in insn.regs_write] if insn.regs_write else []
+                })
+        except Exception as e:
+            print(f"Warning: Could not disassemble .text section: {e}")
+            return function_calls
+        
+        # Find call instructions
+        for insn in all_instructions:
+            if insn['mnemonic'] == 'call':
+                call_addr = insn['address']
+                
+                # Model function call effects on SIMD registers
+                # For now, we'll use conservative assumptions:
+                # - XMM0-XMM7 can be used for arguments (SysV ABI)
+                # - XMM0 can be used for return values
+                # - All XMM registers are caller-saved (can be clobbered)
+                
+                # This is a simplified model - in practice, we'd need to analyze
+                # the called function to determine exact argument/return usage
+                function_calls[call_addr] = {
+                    'args': set(),  # Will be filled by argument detection
+                    'returns': {'xmm0'},  # Conservative: assume XMM0 might be returned
+                    'clobbered': set()  # All XMM registers are caller-saved
+                }
+        
+        return function_calls
+    
+    def _detect_function_arguments(self, simd_instructions: List[Dict], basic_blocks: List[Dict]) -> Dict:
+        """Detect SIMD registers used as function arguments (used without being loaded first)."""
+        function_args = {}
+        
+        # Build a mapping of all instructions in each basic block
+        block_instructions = {}
+        for block in basic_blocks:
+            block_addr = block['address']
+            block_size = block['size']
+            block_end = block_addr + block_size
+            
+            block_insns = []
+            for insn in simd_instructions:
+                insn_addr = insn['address']
+                if block_addr <= insn_addr < block_end:
+                    block_insns.append(insn)
+            
+            # Sort by address
+            block_insns.sort(key=lambda x: x['address'])
+            block_instructions[block_addr] = block_insns
+        
+        # For each basic block, analyze SIMD register usage patterns
+        for block_addr, block_insns in block_instructions.items():
+            if not block_insns:
+                continue
+            
+            # Track which SIMD registers have been loaded in this block
+            loaded_regs = set()
+            
+            for insn in block_insns:
+                insn_addr = insn['address']
+                regs_read = set(insn.get('regs_read', []))
+                regs_write = set(insn.get('regs_write', []))
+                
+                # Filter to SIMD registers
+                simd_regs_read = regs_read.intersection({f'xmm{i}' for i in range(32)})
+                simd_regs_write = regs_write.intersection({f'xmm{i}' for i in range(32)})
+                
+                # Check for registers used without being loaded first
+                unloaded_reads = simd_regs_read - loaded_regs
+                
+                if unloaded_reads:
+                    # These registers are likely function arguments
+                    function_args[insn_addr] = unloaded_reads
+                
+                # Update loaded registers
+                loaded_regs.update(simd_regs_write)
+        
+        return function_args
     
     def _get_instruction_successors(self, insn_addr: int, block_insns: List[Dict], 
                                   block_edges: Dict, block_to_insns: Dict, 
-                                  insn_to_block: Dict) -> List[int]:
+                                  insn_to_block: Dict, base_offset: int) -> List[int]:
         """Get the successors of an instruction based on CFG edges."""
         successors = []
         
         # Find the position of this instruction in the block
         insn_index = -1
         for i, insn in enumerate(block_insns):
-            if insn['address'] == insn_addr:
+            if insn['address'] + base_offset == insn_addr:  # Compare normalized addresses
                 insn_index = i
                 break
         
@@ -876,7 +1115,7 @@ class BinaryAnalyzer:
         # If this is not the last instruction in the block, next instruction is successor
         if insn_index < len(block_insns) - 1:
             next_insn = block_insns[insn_index + 1]
-            successors.append(next_insn['address'])
+            successors.append(next_insn['address'] + base_offset)  # Return normalized address
         
         # If this is the last instruction in the block, check CFG edges
         elif insn_index == len(block_insns) - 1:
@@ -890,51 +1129,160 @@ class BinaryAnalyzer:
                         succ_block_insns = block_to_insns[succ_block_addr]
                         if succ_block_insns:
                             # First instruction of successor block
-                            successors.append(succ_block_insns[0]['address'])
+                            successors.append(succ_block_insns[0]['address'] + base_offset)
         
         return successors
     
-    def _identify_session_boundaries(self, simd_instructions: List[Dict], liveness_info: Dict) -> List[Dict]:
-        """Identify AVX session start and end boundaries."""
+    def _identify_session_boundaries(self, simd_instructions: List[Dict], liveness_info: Dict, base_offset: int) -> List[Dict]:
+        """Identify AVX session start and end boundaries with function call handling."""
+        print(f"\n=== DEBUG: Identifying Session Boundaries ===")
+        print(f"SIMD instructions: {len(simd_instructions)}")
+        
         sessions = []
         live_in = liveness_info['live_in']
         live_out = liveness_info['live_out']
+        function_calls = liveness_info.get('function_calls', {})
+        function_args = liveness_info.get('function_args', {})
+        
+        print(f"Live-in entries: {len(live_in)}")
+        print(f"Live-out entries: {len(live_out)}")
+        print(f"Function calls: {len(function_calls)}")
+        print(f"Function args: {len(function_args)}")
+        
+        # Show first few live-in/live-out entries
+        print(f"\nFirst 5 live-in entries:")
+        for i, (addr, live_regs) in enumerate(list(live_in.items())[:5]):
+            print(f"  {i}: 0x{addr:x} -> {live_regs}")
+        
+        print(f"\nFirst 5 live-out entries:")
+        for i, (addr, live_regs) in enumerate(list(live_out.items())[:5]):
+            print(f"  {i}: 0x{addr:x} -> {live_regs}")
+        
+        # Create a combined list of SIMD instructions and function calls
+        all_instructions = []
+        
+        # Add all SIMD instructions
+        for insn in simd_instructions:
+            all_instructions.append({
+                'address': insn['address'],
+                'mnemonic': insn['mnemonic'],
+                'operands': insn['operands'],
+                'is_simd': True,
+                'instruction': insn
+            })
+        
+        # Add function calls as special instructions
+        for call_addr, call_info in function_calls.items():
+            all_instructions.append({
+                'address': call_addr,
+                'mnemonic': 'call',
+                'operands': f'0x{call_addr:x}',
+                'is_simd': False,
+                'call_info': call_info
+            })
+        
+        # Sort all instructions by address
+        all_instructions.sort(key=lambda x: x['address'])
+        
+        print(f"\nProcessing {len(all_instructions)} instructions for session detection...")
         
         current_session = None
         
-        for i, insn in enumerate(simd_instructions):
-            insn_addr = insn['address']
+        for i, insn in enumerate(all_instructions):
+            insn_addr = insn['address'] + base_offset  # Normalize address
+            
+            # Debug session start detection for first few instructions
+            if i < 5:
+                live_in_regs = live_in.get(insn_addr, set())
+                live_out_regs = live_out.get(insn_addr, set())
+                is_function_arg = insn_addr in function_args
+                should_start = current_session is None and (live_in_regs or live_out_regs or is_function_arg)
+                print(f"  Instruction {i}: 0x{insn_addr:x} {insn['mnemonic']} {insn['operands']}")
+                print(f"    Live-in: {live_in_regs}")
+                print(f"    Live-out: {live_out_regs}")
+                print(f"    Function arg: {is_function_arg}")
+                print(f"    Current session: {current_session is not None}")
+                print(f"    Should start session: {should_start}")
             
             # Check if we're starting a new session
-            if current_session is None and live_in[insn_addr]:
+            # Session starts when:
+            # 1. We have live registers coming in (live_in is non-empty), OR
+            # 2. We create live registers (live_out is non-empty but live_in is empty), OR
+            # 3. We detect function arguments (registers used without being loaded first)
+            if current_session is None and (live_in.get(insn_addr, set()) or live_out.get(insn_addr, set()) or insn_addr in function_args):
+                # Determine which registers are live for this session
+                live_registers = live_in.get(insn_addr, set()) if live_in.get(insn_addr, set()) else live_out.get(insn_addr, set())
+                
+                # Add function arguments to live registers
+                if insn_addr in function_args:
+                    live_registers.update(function_args[insn_addr])
+                
                 # Session start: first instruction with live SIMD registers
                 current_session = {
                     'start_address': insn_addr,
-                    'start_instruction': insn,
+                    'start_instruction': insn['instruction'] if insn['is_simd'] else {
+                        'address': insn_addr,
+                        'mnemonic': insn['mnemonic'],
+                        'operands': insn['operands']
+                    },
                     'end_address': None,
                     'end_instruction': None,
-                    'live_registers': list(live_in[insn_addr]),
-                    'instructions': [insn]
+                    'live_registers': list(live_registers),
+                    'instructions': [insn['instruction'] if insn['is_simd'] else {
+                        'address': insn_addr,
+                        'mnemonic': insn['mnemonic'],
+                        'operands': insn['operands']
+                    }]
                 }
             
             # If we're in a session, add this instruction
             elif current_session is not None:
-                current_session['instructions'].append(insn)
+                # Add instruction to session
+                if insn['is_simd']:
+                    current_session['instructions'].append(insn['instruction'])
+                else:
+                    # Add function call as a special instruction
+                    current_session['instructions'].append({
+                        'address': insn_addr,
+                        'mnemonic': insn['mnemonic'],
+                        'operands': insn['operands']
+                    })
+                
+                # Update live registers if function arguments are detected
+                if insn_addr in function_args:
+                    current_session['live_registers'].extend(function_args[insn_addr])
+                    # Remove duplicates
+                    current_session['live_registers'] = list(set(current_session['live_registers']))
                 
                 # Check if session should end
-                if not live_out[insn_addr]:
+                # Exception: if this is a function call, continue the session
+                if not live_out.get(insn_addr, set()) and insn_addr not in function_calls:
                     # Session end: no live registers after this instruction
                     current_session['end_address'] = insn_addr
-                    current_session['end_instruction'] = insn
+                    current_session['end_instruction'] = insn['instruction'] if insn['is_simd'] else {
+                        'address': insn_addr,
+                        'mnemonic': insn['mnemonic'],
+                        'operands': insn['operands']
+                    }
                     sessions.append(current_session)
                     current_session = None
         
         # Handle case where session extends to end of function
         if current_session is not None:
-            current_session['end_address'] = simd_instructions[-1]['address']
-            current_session['end_instruction'] = simd_instructions[-1]
+            current_session['end_address'] = all_instructions[-1]['address']
+            current_session['end_instruction'] = all_instructions[-1]['instruction'] if all_instructions[-1]['is_simd'] else {
+                'address': all_instructions[-1]['address'],
+                'mnemonic': all_instructions[-1]['mnemonic'],
+                'operands': all_instructions[-1]['operands']
+            }
             sessions.append(current_session)
-        
+
+        print(f"\nSession detection complete: {len(sessions)} sessions found")
+        for i, session in enumerate(sessions):
+            print(f"  Session {i}: 0x{session['start_address']:x} - 0x{session['end_address']:x}")
+            print(f"    Live registers: {session['live_registers']}")
+            print(f"    Instructions: {len(session['instructions'])}")
+
         return sessions
     
     def generate_metadata(self) -> Dict:
@@ -956,6 +1304,116 @@ class BinaryAnalyzer:
             metadata['avx_sessions'][module_key] = sessions
         
         return metadata
+    
+    def run_recall_test(self, module_name: str) -> Dict:
+        """Run recall test to identify SIMD instructions not covered by AVX sessions."""
+        print(f"\n=== Running Recall Test for {module_name} ===")
+        
+        # Get all SIMD instructions for this module
+        # Find the correct key in simd_instructions (might be full path)
+        module_key = None
+        for key in self.simd_instructions.keys():
+            if os.path.basename(key) == module_name:
+                module_key = key
+                break
+        
+        if module_key is None:
+            print(f"Warning: Could not find SIMD instructions for module {module_name}")
+            return {}
+        
+        all_simd_instructions = self.simd_instructions.get(module_key, [])
+        avx_sessions = self.avx_sessions.get(module_key, [])
+        
+        print(f"Total SIMD instructions: {len(all_simd_instructions)}")
+        print(f"Total AVX sessions: {len(avx_sessions)}")
+        
+        # Build maps for efficient lookup
+        # Map: instruction_address -> instruction_info
+        simd_instruction_map = {insn['address']: insn for insn in all_simd_instructions}
+        
+        # Map: session_address_range -> session_info
+        session_ranges = []
+        for session in avx_sessions:
+            start_addr = session['start_address']
+            end_addr = session['end_address']
+            session_ranges.append((start_addr, end_addr, session))
+        
+        # Sort session ranges by start address for efficient lookup
+        session_ranges.sort(key=lambda x: x[0])
+        
+        # Find uncovered SIMD instructions
+        uncovered_instructions = []
+        
+        for insn_addr, insn_info in simd_instruction_map.items():
+            # Check if this instruction is covered by any AVX session
+            covered = False
+            
+            for start_addr, end_addr, session in session_ranges:
+                if start_addr <= insn_addr <= end_addr:
+                    # Check if this instruction is actually in the session's instruction list
+                    session_insn_addrs = {insn['address'] for insn in session['instructions']}
+                    if insn_addr in session_insn_addrs:
+                        covered = True
+                        break
+            
+            if not covered:
+                uncovered_instructions.append(insn_info)
+        
+        print(f"Uncovered SIMD instructions: {len(uncovered_instructions)}")
+        
+        # Analyze uncovered instructions by function
+        uncovered_by_function = {}
+        for insn in uncovered_instructions:
+            # Try to determine which function this instruction belongs to
+            func_name = self._find_function_for_instruction(insn['address'], module_key)
+            if func_name not in uncovered_by_function:
+                uncovered_by_function[func_name] = []
+            uncovered_by_function[func_name].append(insn)
+        
+        # Generate detailed analysis
+        recall_results = {
+            'module_name': module_name,
+            'total_simd_instructions': len(all_simd_instructions),
+            'total_avx_sessions': len(avx_sessions),
+            'uncovered_instructions': len(uncovered_instructions),
+            'coverage_percentage': ((len(all_simd_instructions) - len(uncovered_instructions)) / len(all_simd_instructions) * 100) if all_simd_instructions else 100,
+            'uncovered_by_function': {}
+        }
+        
+        # Detailed analysis of uncovered instructions
+        for func_name, func_insns in uncovered_by_function.items():
+            recall_results['uncovered_by_function'][func_name] = {
+                'count': len(func_insns),
+                'instructions': func_insns
+            }
+            
+            print(f"\nFunction {func_name}: {len(func_insns)} uncovered instructions")
+            for insn in func_insns[:5]:  # Show first 5
+                print(f"  0x{insn['address']:08x} {insn['mnemonic']} {insn['operands']}")
+            if len(func_insns) > 5:
+                print(f"  ... and {len(func_insns) - 5} more")
+        
+        return recall_results
+    
+    def _find_function_for_instruction(self, insn_addr: int, module_name: str) -> str:
+        """Find which function contains the given instruction address."""
+        # Use CFG data to find the function
+        cfg_data = self.cfg_data.get(module_name, {})
+        functions = cfg_data.get('functions', [])
+        
+        for func in functions:
+            if isinstance(func, dict):
+                func_addr = func.get('address', 0)
+                func_size = func.get('size', 0)
+                if func_addr <= insn_addr < func_addr + func_size:
+                    return func.get('name', f'func_0x{func_addr:x}')
+            elif isinstance(func, int):
+                # Handle case where functions is a list of addresses
+                func_addr = func
+                if func_addr <= insn_addr < func_addr + 0x1000:  # Assume 4KB function size
+                    return f'func_0x{func_addr:x}'
+        
+        return f'unknown_func_0x{insn_addr:x}'
     
     def save_metadata(self, output_file: str = None) -> str:
         """Save metadata to a JSON file for runtime use."""
@@ -1156,6 +1614,9 @@ Example usage:
     parser.add_argument('-b', '--binary-only', action='store_true',
                        help='For binaries: analyze only the main binary, skip dependencies')
     
+    parser.add_argument('-r', '--recall-test', action='store_true',
+                       help='Run recall test to identify uncovered SIMD instructions')
+    
     parser.add_argument('--no-metadata', action='store_true',
                        help='Skip saving metadata JSON file')
     
@@ -1168,6 +1629,25 @@ Example usage:
     
     if success:
         print("Analysis completed successfully!")
+        
+        # Run recall test if requested
+        if args.recall_test:
+            print("\n" + "="*60)
+            print("RUNNING RECALL TEST")
+            print("="*60)
+            
+            # Run recall test for each analyzed module
+            for module_path in analyzer.libraries.keys():
+                module_name = os.path.basename(module_path)
+                recall_results = analyzer.run_recall_test(module_name)
+                
+                # Save recall test results
+                recall_file = f"{module_name}.recall_test.json"
+                import json
+                with open(recall_file, 'w') as f:
+                    json.dump(recall_results, f, indent=2)
+                print(f"Recall test results saved to: {recall_file}")
+        
         return 0
     else:
         print("Analysis failed!")
