@@ -661,49 +661,218 @@ class BinaryAnalyzer:
         
         return success_count > 0
     
+    def analyze_simd_liveness(self) -> bool:
+        """Perform liveness analysis on SIMD registers to identify AVX session boundaries."""
+        print("\n=== Performing SIMD Register Liveness Analysis ===")
+        
+        self.avx_sessions = {}
+        
+        for module_path, cfg_data in self.cfg_data.items():
+            if not cfg_data.get('analysis_success', False):
+                print(f"Skipping {module_path} - CFG analysis failed")
+                continue
+                
+            print(f"Analyzing liveness for {module_path}...")
+            module_sessions = self._analyze_module_liveness(module_path, cfg_data)
+            self.avx_sessions[module_path] = module_sessions
+            
+            total_sessions = len(module_sessions)
+            print(f"Found {total_sessions} AVX sessions in {module_path}")
+        
+        total_sessions = sum(len(sessions) for sessions in self.avx_sessions.values())
+        print(f"Total AVX sessions found: {total_sessions}")
+        
+        return total_sessions > 0
+    
+    def _analyze_module_liveness(self, module_path: str, cfg_data: Dict) -> List[Dict]:
+        """Analyze liveness for a single module."""
+        sessions = []
+        
+        # Get SIMD instructions for this module
+        simd_instructions = self.simd_instructions.get(module_path, [])
+        if not simd_instructions:
+            return sessions
+        
+        # Group SIMD instructions by function
+        func_simd_instructions = self._group_simd_by_function(simd_instructions, cfg_data)
+        
+        # Analyze each function
+        for func_addr, func_simd_insns in func_simd_instructions.items():
+            if not func_simd_insns:
+                continue
+                
+            func_sessions = self._analyze_function_liveness(func_addr, func_simd_insns, cfg_data)
+            sessions.extend(func_sessions)
+        
+        return sessions
+    
+    def _group_simd_by_function(self, simd_instructions: List[Dict], cfg_data: Dict) -> Dict:
+        """Group SIMD instructions by function."""
+        func_simd = {}
+        
+        for simd_insn in simd_instructions:
+            insn_addr = simd_insn['address']
+            
+            # Find which function contains this instruction
+            for func_addr, func_info in cfg_data.get('functions', {}).items():
+                func_start = func_info['address']
+                func_end = func_start + func_info.get('size', 0)
+                
+                if func_start <= insn_addr < func_end:
+                    if func_addr not in func_simd:
+                        func_simd[func_addr] = []
+                    func_simd[func_addr].append(simd_insn)
+                    break
+        
+        return func_simd
+    
+    def _analyze_function_liveness(self, func_addr: int, simd_instructions: List[Dict], cfg_data: Dict) -> List[Dict]:
+        """Analyze liveness for a single function."""
+        sessions = []
+        
+        # Sort SIMD instructions by address
+        simd_instructions.sort(key=lambda x: x['address'])
+        
+        # Get function's basic blocks
+        func_info = cfg_data['functions'].get(func_addr, {})
+        basic_blocks = func_info.get('basic_blocks', [])
+        
+        if not basic_blocks:
+            return sessions
+        
+        # Perform liveness analysis
+        liveness_info = self._compute_liveness(simd_instructions, basic_blocks)
+        
+        # Identify session boundaries
+        sessions = self._identify_session_boundaries(simd_instructions, liveness_info)
+        
+        return sessions
+    
+    def _compute_liveness(self, simd_instructions: List[Dict], basic_blocks: List[Dict]) -> Dict:
+        """Compute liveness information for SIMD registers."""
+        # Initialize liveness sets
+        live_in = {}  # instruction -> set of live registers
+        live_out = {}  # instruction -> set of live registers
+        
+        # SIMD register universe (XMM0-XMM31, YMM0-YMM31, ZMM0-ZMM31)
+        simd_regs = set()
+        for i in range(32):
+            simd_regs.add(f'xmm{i}')
+            simd_regs.add(f'ymm{i}')
+            simd_regs.add(f'zmm{i}')
+        
+        # Initialize all instructions with empty live sets
+        for insn in simd_instructions:
+            insn_addr = insn['address']
+            live_in[insn_addr] = set()
+            live_out[insn_addr] = set()
+        
+        # Perform backward data-flow analysis
+        changed = True
+        iteration = 0
+        max_iterations = 100  # Prevent infinite loops
+        
+        while changed and iteration < max_iterations:
+            changed = False
+            iteration += 1
+            
+            # Process instructions in reverse order
+            for insn in reversed(simd_instructions):
+                insn_addr = insn['address']
+                
+                # Get registers read and written by this instruction
+                regs_read = set(insn.get('regs_read', []))
+                regs_write = set(insn.get('regs_write', []))
+                
+                # Filter to only SIMD registers
+                simd_regs_read = regs_read.intersection(simd_regs)
+                simd_regs_write = regs_write.intersection(simd_regs)
+                
+                # Live-out: union of live-in sets of successors
+                old_live_out = live_out[insn_addr].copy()
+                live_out[insn_addr] = set()
+                
+                # For simplicity, assume sequential execution within basic blocks
+                # In a more sophisticated implementation, we'd use CFG edges
+                for other_insn in simd_instructions:
+                    if other_insn['address'] > insn_addr:
+                        live_out[insn_addr].update(live_in[other_insn['address']])
+                        break
+                
+                # Live-in: (live-out - written) ∪ read
+                old_live_in = live_in[insn_addr].copy()
+                live_in[insn_addr] = (live_out[insn_addr] - simd_regs_write).union(simd_regs_read)
+                
+                # Check if anything changed
+                if live_in[insn_addr] != old_live_in or live_out[insn_addr] != old_live_out:
+                    changed = True
+        
+        return {
+            'live_in': live_in,
+            'live_out': live_out,
+            'simd_regs': simd_regs
+        }
+    
+    def _identify_session_boundaries(self, simd_instructions: List[Dict], liveness_info: Dict) -> List[Dict]:
+        """Identify AVX session start and end boundaries."""
+        sessions = []
+        live_in = liveness_info['live_in']
+        live_out = liveness_info['live_out']
+        
+        current_session = None
+        
+        for i, insn in enumerate(simd_instructions):
+            insn_addr = insn['address']
+            
+            # Check if we're starting a new session
+            if current_session is None and live_in[insn_addr]:
+                # Session start: first instruction with live SIMD registers
+                current_session = {
+                    'start_address': insn_addr,
+                    'start_instruction': insn,
+                    'end_address': None,
+                    'end_instruction': None,
+                    'live_registers': live_in[insn_addr].copy(),
+                    'instructions': [insn]
+                }
+            
+            # If we're in a session, add this instruction
+            elif current_session is not None:
+                current_session['instructions'].append(insn)
+                
+                # Check if session should end
+                if not live_out[insn_addr]:
+                    # Session end: no live registers after this instruction
+                    current_session['end_address'] = insn_addr
+                    current_session['end_instruction'] = insn
+                    sessions.append(current_session)
+                    current_session = None
+        
+        # Handle case where session extends to end of function
+        if current_session is not None:
+            current_session['end_address'] = simd_instructions[-1]['address']
+            current_session['end_instruction'] = simd_instructions[-1]
+            sessions.append(current_session)
+        
+        return sessions
+    
     def generate_metadata(self) -> Dict:
-        """Generate metadata for runtime reconstruction of AVX sessions."""
+        """Generate metadata containing only AVX session data."""
         metadata = {
-            'modules': {},
-            'simd_instructions': {},
-            'cfg_data': {},
+            'avx_sessions': {},
             'analysis_info': {
                 'binary_path': str(self.binary_path),
                 'total_modules': len(self.libraries),
-                'total_simd_instructions': sum(len(instructions) for instructions in self.simd_instructions.values()),
-                'total_functions': sum(len(cfg.get('functions', {})) for cfg in self.cfg_data.values()),
-                'total_basic_blocks': sum(len(cfg.get('basic_blocks', {})) for cfg in self.cfg_data.values()),
+                'total_avx_sessions': sum(len(sessions) for sessions in self.avx_sessions.values()),
                 'addressing_mode': 'relative',  # All addresses are relative to module base
                 'note': 'All addresses are relative to module base. Runtime must add actual base addresses from /proc/pid/maps.'
             }
         }
         
-        for module_path, info in self.libraries.items():
+        # Add AVX sessions for each module
+        for module_path, sessions in self.avx_sessions.items():
             module_key = os.path.basename(module_path)
-            module_info = {
-                'path': info['path'],
-                'type': info['type'],
-                'name': info.get('name', module_key)
-            }
-            
-            # Add binary-specific info
-            if info['type'] == 'main_binary':
-                module_info['binary_type'] = info.get('binary_type', 'unknown')
-                module_info['entry_point'] = info.get('entry_point', 0)
-            else:
-                module_info['entry_point'] = info.get('entry_point', 0)
-            
-            metadata['modules'][module_key] = module_info
-        
-        # Add SIMD instructions for each module
-        for module_path, simd_instructions in self.simd_instructions.items():
-            module_key = os.path.basename(module_path)
-            metadata['simd_instructions'][module_key] = simd_instructions
-        
-        # Add CFG data for each module
-        for module_path, cfg_data in self.cfg_data.items():
-            module_key = os.path.basename(module_path)
-            metadata['cfg_data'][module_key] = cfg_data
+            metadata['avx_sessions'][module_key] = sessions
         
         return metadata
     
@@ -770,7 +939,7 @@ class BinaryAnalyzer:
                 print(f"  Error: {cfg_info['error_details'][:100]}...")
             print()
     
-    def run_analysis(self, save_metadata: bool = True, force: bool = False) -> bool:
+    def run_analysis(self, save_metadata: bool = True, force: bool = False, binary_only: bool = False) -> bool:
         """Run the complete analysis with enhanced workflow."""
         print(f"Starting AVX session analysis for: {self.binary_path}")
         
@@ -797,7 +966,7 @@ class BinaryAnalyzer:
         else:
             # Binary analysis with dependencies
             print("Performing binary analysis with dependencies...")
-            return self._analyze_binary_with_deps(save_metadata, force)
+            return self._analyze_binary_with_deps(save_metadata, force, binary_only)
     
     def _analyze_library_only(self, save_metadata: bool) -> bool:
         """Analyze a single library."""
@@ -817,6 +986,9 @@ class BinaryAnalyzer:
         if not self.analyze_cfg():
             print("Warning: CFG analysis failed")
         
+        if not self.analyze_simd_liveness():
+            print("Warning: Liveness analysis failed")
+        
         self.print_summary()
         
         if save_metadata:
@@ -824,17 +996,42 @@ class BinaryAnalyzer:
         
         return True
     
-    def _analyze_binary_with_deps(self, save_metadata: bool, force: bool) -> bool:
-        """Analyze binary with dependencies, skipping existing metadata."""
+    def _analyze_binary_with_deps(self, save_metadata: bool, force: bool, binary_only: bool = False) -> bool:
+        """Analyze binary with dependencies, optionally skipping dependency analysis."""
         if not self.analyze_dependencies():
             print("Error: Failed to analyze dependencies")
             return False
+        
+        if binary_only:
+            print("Binary-only mode: Skipping dependency analysis")
+            # Remove all dependencies from analysis, keep only the main binary
+            main_binary_path = str(self.binary_path)
+            if main_binary_path in self.libraries:
+                # Keep only the main binary
+                main_binary_info = self.libraries[main_binary_path]
+                self.libraries = {main_binary_path: main_binary_info}
+                
+                # Remove SIMD instructions and CFG data for dependencies
+                if main_binary_path in self.simd_instructions:
+                    main_simd = self.simd_instructions[main_binary_path]
+                    self.simd_instructions = {main_binary_path: main_simd}
+                else:
+                    self.simd_instructions = {}
+                
+                if main_binary_path in self.cfg_data:
+                    main_cfg = self.cfg_data[main_binary_path]
+                    self.cfg_data = {main_binary_path: main_cfg}
+                else:
+                    self.cfg_data = {}
         
         if not self.analyze_simd_instructions():
             print("Warning: No SIMD instructions found")
         
         if not self.analyze_cfg():
             print("Warning: CFG analysis failed for some modules")
+        
+        if not self.analyze_simd_liveness():
+            print("Warning: Liveness analysis failed")
         
         self.print_summary()
         
@@ -859,11 +1056,13 @@ Workflow:
 - For binaries: Analyzes the binary and all its dependencies
 - For libraries: Analyzes only the library itself
 - Skips analysis if metadata file already exists (use -f to force)
+- Use -b to analyze only the main binary (skip dependencies)
 
 Example usage:
   python3 avxdump.py /usr/bin/ls                    # Analyze binary with dependencies
   python3 avxdump.py /lib/x86_64-linux-gnu/libc.so.6  # Analyze library only
   python3 avxdump.py -f /usr/bin/ls                 # Force overwrite existing metadata
+  python3 avxdump.py -b /usr/bin/cat                # Analyze only main binary (fast)
         """
     )
     
@@ -873,6 +1072,9 @@ Example usage:
     parser.add_argument('-f', '--force', action='store_true',
                        help='Force analysis even if metadata file already exists')
     
+    parser.add_argument('-b', '--binary-only', action='store_true',
+                       help='For binaries: analyze only the main binary, skip dependencies')
+    
     parser.add_argument('--no-metadata', action='store_true',
                        help='Skip saving metadata JSON file')
     
@@ -881,7 +1083,7 @@ Example usage:
     # Create analyzer and run analysis
     analyzer = BinaryAnalyzer(args.target_path)
     
-    success = analyzer.run_analysis(save_metadata=not args.no_metadata, force=args.force)
+    success = analyzer.run_analysis(save_metadata=not args.no_metadata, force=args.force, binary_only=args.binary_only)
     
     if success:
         print("Analysis completed successfully!")
