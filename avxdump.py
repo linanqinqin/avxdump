@@ -46,7 +46,7 @@ class BinaryAnalyzer:
     
     def __init__(self, binary_path: str):
         self.binary_path = Path(binary_path)
-        self.binary_file = None
+        self.elf_file = None
         self.libraries = {}  # Dict[str, Dict] - library name -> info dict
         self.simd_instructions = {}  # Dict[str, List] - module -> list of SIMD instructions
         self.cfg_data = {}  # Dict[str, Dict] - module -> CFG information
@@ -54,6 +54,16 @@ class BinaryAnalyzer:
         # Initialize Capstone disassembler
         self.cs = capstone.Cs(CS_ARCH_X86, CS_MODE_64)
         self.cs.detail = True  # Enable detailed instruction information
+        
+        # Open the ELF file
+        if self.validate_binary():
+            try:
+                with open(self.binary_path, 'rb') as f:
+                    self.elf_file = ELFFile(f)
+                    print(f"Successfully opened binary: {self.binary_path}")
+            except Exception as e:
+                print(f"Error opening ELF file: {e}")
+                self.elf_file = None
         
     def validate_binary(self) -> bool:
         """Validate that the binary exists and is a valid ELF file."""
@@ -81,7 +91,7 @@ class BinaryAnalyzer:
     def open_binary(self) -> bool:
         """Open the main binary file using pyelftools."""
         try:
-            self.binary_file = ELFFile(open(self.binary_path, 'rb'))
+            self.elf_file = ELFFile(open(self.binary_path, 'rb'))
             print(f"Successfully opened binary: {self.binary_path}")
             return True
         except Exception as e:
@@ -94,7 +104,7 @@ class BinaryAnalyzer:
         
         try:
             # Find the dynamic section
-            dynamic_section = self.binary_file.get_section_by_name('.dynamic')
+            dynamic_section = self.elf_file.get_section_by_name('.dynamic')
             if not dynamic_section:
                 print("Warning: No .dynamic section found (static binary?)")
                 return libraries
@@ -115,10 +125,10 @@ class BinaryAnalyzer:
     def get_binary_info(self) -> Dict:
         """Get information about the main binary."""
         try:
-            entry_point = self.binary_file.header.e_entry
+            entry_point = self.elf_file.header.e_entry
             
             # Check if it's a PIE binary
-            if self.binary_file.header.e_type == 'ET_DYN':
+            if self.elf_file.header.e_type == 'ET_DYN':
                 print(f"PIE binary detected, entry point: 0x{entry_point:x}")
                 binary_type = "PIE"
             else:
@@ -749,7 +759,7 @@ class BinaryAnalyzer:
         return sessions
     
     def _compute_liveness(self, simd_instructions: List[Dict], basic_blocks: List[Dict]) -> Dict:
-        """Compute liveness information for SIMD registers."""
+        """Compute liveness information for SIMD registers using CFG-based analysis."""
         # Initialize liveness sets
         live_in = {}  # instruction -> set of live registers
         live_out = {}  # instruction -> set of live registers
@@ -767,7 +777,33 @@ class BinaryAnalyzer:
             live_in[insn_addr] = set()
             live_out[insn_addr] = set()
         
-        # Perform backward data-flow analysis
+        # Build instruction-to-basic-block mapping
+        insn_to_block = {}
+        block_to_insns = {}
+        
+        for block in basic_blocks:
+            block_addr = block['address']
+            block_size = block['size']
+            block_end = block_addr + block_size
+            
+            block_insns = []
+            for insn in simd_instructions:
+                insn_addr = insn['address']
+                if block_addr <= insn_addr < block_end:
+                    insn_to_block[insn_addr] = block_addr
+                    block_insns.append(insn)
+            
+            # Sort instructions within block by address
+            block_insns.sort(key=lambda x: x['address'])
+            block_to_insns[block_addr] = block_insns
+        
+        # Build CFG edges mapping
+        block_edges = {}
+        for block in basic_blocks:
+            block_addr = block['address']
+            block_edges[block_addr] = block.get('successors', [])
+        
+        # Perform CFG-based backward data-flow analysis
         changed = True
         iteration = 0
         max_iterations = 100  # Prevent infinite loops
@@ -776,42 +812,87 @@ class BinaryAnalyzer:
             changed = False
             iteration += 1
             
-            # Process instructions in reverse order
-            for insn in reversed(simd_instructions):
-                insn_addr = insn['address']
+            # Process basic blocks in reverse order
+            for block_addr in reversed(sorted(block_to_insns.keys())):
+                block_insns = block_to_insns[block_addr]
+                if not block_insns:
+                    continue
                 
-                # Get registers read and written by this instruction
-                regs_read = set(insn.get('regs_read', []))
-                regs_write = set(insn.get('regs_write', []))
-                
-                # Filter to only SIMD registers
-                simd_regs_read = regs_read.intersection(simd_regs)
-                simd_regs_write = regs_write.intersection(simd_regs)
-                
-                # Live-out: union of live-in sets of successors
-                old_live_out = live_out[insn_addr].copy()
-                live_out[insn_addr] = set()
-                
-                # For simplicity, assume sequential execution within basic blocks
-                # In a more sophisticated implementation, we'd use CFG edges
-                for other_insn in simd_instructions:
-                    if other_insn['address'] > insn_addr:
-                        live_out[insn_addr].update(live_in[other_insn['address']])
-                        break
-                
-                # Live-in: (live-out - written) ∪ read
-                old_live_in = live_in[insn_addr].copy()
-                live_in[insn_addr] = (live_out[insn_addr] - simd_regs_write).union(simd_regs_read)
-                
-                # Check if anything changed
-                if live_in[insn_addr] != old_live_in or live_out[insn_addr] != old_live_out:
-                    changed = True
+                # Process instructions within block in reverse order
+                for insn in reversed(block_insns):
+                    insn_addr = insn['address']
+                    
+                    # Get registers read and written by this instruction
+                    regs_read = set(insn.get('regs_read', []))
+                    regs_write = set(insn.get('regs_write', []))
+                    
+                    # Filter to only SIMD registers
+                    simd_regs_read = regs_read.intersection(simd_regs)
+                    simd_regs_write = regs_write.intersection(simd_regs)
+                    
+                    # Live-out: union of live-in sets of successors
+                    old_live_out = live_out[insn_addr].copy()
+                    live_out[insn_addr] = set()
+                    
+                    # Find successors of this instruction
+                    successors = self._get_instruction_successors(insn_addr, block_insns, block_edges, block_to_insns, insn_to_block)
+                    
+                    for succ_addr in successors:
+                        if succ_addr in live_in:
+                            live_out[insn_addr].update(live_in[succ_addr])
+                    
+                    # Live-in: (live-out - written) ∪ read
+                    old_live_in = live_in[insn_addr].copy()
+                    live_in[insn_addr] = (live_out[insn_addr] - simd_regs_write).union(simd_regs_read)
+                    
+                    # Check if anything changed
+                    if live_in[insn_addr] != old_live_in or live_out[insn_addr] != old_live_out:
+                        changed = True
         
         return {
             'live_in': live_in,
             'live_out': live_out,
-            'simd_regs': simd_regs
+            'simd_regs': simd_regs,
+            'insn_to_block': insn_to_block,
+            'block_to_insns': block_to_insns
         }
+    
+    def _get_instruction_successors(self, insn_addr: int, block_insns: List[Dict], 
+                                  block_edges: Dict, block_to_insns: Dict, 
+                                  insn_to_block: Dict) -> List[int]:
+        """Get the successors of an instruction based on CFG edges."""
+        successors = []
+        
+        # Find the position of this instruction in the block
+        insn_index = -1
+        for i, insn in enumerate(block_insns):
+            if insn['address'] == insn_addr:
+                insn_index = i
+                break
+        
+        if insn_index == -1:
+            return successors
+        
+        # If this is not the last instruction in the block, next instruction is successor
+        if insn_index < len(block_insns) - 1:
+            next_insn = block_insns[insn_index + 1]
+            successors.append(next_insn['address'])
+        
+        # If this is the last instruction in the block, check CFG edges
+        elif insn_index == len(block_insns) - 1:
+            # This is the last instruction in the block
+            block_addr = insn_to_block.get(insn_addr)
+            if block_addr and block_addr in block_edges:
+                # Get successors of this block
+                block_successors = block_edges[block_addr]
+                for succ_block_addr in block_successors:
+                    if succ_block_addr in block_to_insns:
+                        succ_block_insns = block_to_insns[succ_block_addr]
+                        if succ_block_insns:
+                            # First instruction of successor block
+                            successors.append(succ_block_insns[0]['address'])
+        
+        return successors
     
     def _identify_session_boundaries(self, simd_instructions: List[Dict], liveness_info: Dict) -> List[Dict]:
         """Identify AVX session start and end boundaries."""
@@ -832,7 +913,7 @@ class BinaryAnalyzer:
                     'start_instruction': insn,
                     'end_address': None,
                     'end_instruction': None,
-                    'live_registers': live_in[insn_addr].copy(),
+                    'live_registers': list(live_in[insn_addr]),
                     'instructions': [insn]
                 }
             
