@@ -410,6 +410,37 @@ class BinaryAnalyzer:
         
         return total_simd > 0
     
+    def get_target_type(self) -> str:
+        """Determine if the target is a binary or library."""
+        try:
+            with open(self.binary_path, 'rb') as f:
+                elf_file = ELFFile(f)
+                
+                if elf_file.header.e_type == 'ET_EXEC':
+                    return 'executable'
+                elif elf_file.header.e_type == 'ET_DYN':
+                    # Check if it has an entry point - libraries typically have entry point 0
+                    entry_point = elf_file.header.e_entry
+                    if entry_point == 0:
+                        return 'library'  # Shared library with no entry point
+                    else:
+                        return 'executable'  # PIE executable with entry point
+                else:
+                    return 'unknown'
+                    
+        except Exception as e:
+            print(f"Error determining target type: {e}")
+            return 'unknown'
+    
+    def get_metadata_filename(self) -> str:
+        """Get the metadata filename for the target."""
+        return f"{self.binary_path.name}.avxdump.json"
+    
+    def metadata_exists(self) -> bool:
+        """Check if metadata file already exists."""
+        metadata_file = self.get_metadata_filename()
+        return os.path.exists(metadata_file)
+    
     def analyze_cfg_module(self, module_path: str, module_info: Dict) -> Dict:
         """Analyze control flow graph for a module using angr CFGFast with robust error handling."""
         cfg_info = {
@@ -739,9 +770,19 @@ class BinaryAnalyzer:
                 print(f"  Error: {cfg_info['error_details'][:100]}...")
             print()
     
-    def run_analysis(self, save_metadata: bool = True) -> bool:
-        """Run the complete analysis."""
+    def run_analysis(self, save_metadata: bool = True, force: bool = False) -> bool:
+        """Run the complete analysis with enhanced workflow."""
         print(f"Starting AVX session analysis for: {self.binary_path}")
+        
+        # Determine target type
+        target_type = self.get_target_type()
+        print(f"Target type: {target_type}")
+        
+        # Check if metadata already exists
+        if not force and self.metadata_exists():
+            print(f"Metadata file {self.get_metadata_filename()} already exists.")
+            print("Use -f/--force to overwrite existing metadata.")
+            return True
         
         if not self.validate_binary():
             return False
@@ -749,6 +790,42 @@ class BinaryAnalyzer:
         if not self.open_binary():
             return False
         
+        if target_type == 'library':
+            # Library-only analysis
+            print("Performing library-only analysis...")
+            return self._analyze_library_only(save_metadata)
+        else:
+            # Binary analysis with dependencies
+            print("Performing binary analysis with dependencies...")
+            return self._analyze_binary_with_deps(save_metadata, force)
+    
+    def _analyze_library_only(self, save_metadata: bool) -> bool:
+        """Analyze a single library."""
+        # Add the library itself to the libraries dict
+        lib_info = self.get_library_info(str(self.binary_path))
+        if lib_info:
+            self.libraries[str(self.binary_path)] = {
+                'path': str(self.binary_path),
+                'type': 'library',
+                'name': self.binary_path.name,
+                'entry_point': lib_info['entry_point']
+            }
+        
+        if not self.analyze_simd_instructions():
+            print("Warning: No SIMD instructions found")
+        
+        if not self.analyze_cfg():
+            print("Warning: CFG analysis failed")
+        
+        self.print_summary()
+        
+        if save_metadata:
+            self.save_metadata()
+        
+        return True
+    
+    def _analyze_binary_with_deps(self, save_metadata: bool, force: bool) -> bool:
+        """Analyze binary with dependencies, skipping existing metadata."""
         if not self.analyze_dependencies():
             print("Error: Failed to analyze dependencies")
             return False
@@ -773,19 +850,28 @@ def main():
         description="AVX Session Analysis Tool - Steps 1-3: Binary Discovery, SIMD Analysis, and CFG Building",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This tool analyzes ELF binaries and performs the first three steps of AVX/SSE session analysis:
-1. Discovers the main binary and all its dependencies
+This tool analyzes ELF binaries and libraries, performing the first three steps of AVX/SSE session analysis:
+1. Discovers the target and its dependencies (for binaries)
 2. Identifies SIMD instructions using Capstone disassembly  
 3. Builds control flow graphs using angr CFGFast analysis
 
+Workflow:
+- For binaries: Analyzes the binary and all its dependencies
+- For libraries: Analyzes only the library itself
+- Skips analysis if metadata file already exists (use -f to force)
+
 Example usage:
-  python3 avxdump.py /usr/bin/ls
-  python3 avxdump.py ./my_program
+  python3 avxdump.py /usr/bin/ls                    # Analyze binary with dependencies
+  python3 avxdump.py /lib/x86_64-linux-gnu/libc.so.6  # Analyze library only
+  python3 avxdump.py -f /usr/bin/ls                 # Force overwrite existing metadata
         """
     )
     
-    parser.add_argument('binary_path', 
-                       help='Path to the ELF binary to analyze')
+    parser.add_argument('target_path', 
+                       help='Path to the ELF binary or library to analyze')
+    
+    parser.add_argument('-f', '--force', action='store_true',
+                       help='Force analysis even if metadata file already exists')
     
     parser.add_argument('--no-metadata', action='store_true',
                        help='Skip saving metadata JSON file')
@@ -793,9 +879,9 @@ Example usage:
     args = parser.parse_args()
     
     # Create analyzer and run analysis
-    analyzer = BinaryAnalyzer(args.binary_path)
+    analyzer = BinaryAnalyzer(args.target_path)
     
-    success = analyzer.run_analysis(save_metadata=not args.no_metadata)
+    success = analyzer.run_analysis(save_metadata=not args.no_metadata, force=args.force)
     
     if success:
         print("Analysis completed successfully!")
