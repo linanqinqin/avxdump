@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-AVX Session Analysis Tool - Step 1: Binary and Library Discovery
+AVX Session Analysis Tool - Steps 1-3: Binary Discovery, SIMD Analysis, and CFG Building
 
-This script implements the first step of static analysis for AVX/SSE usage sessions
-in x86_64 ELF binaries. It discovers the main binary and all its dependencies,
-gathering their load addresses for subsequent analysis.
+This script implements the first three steps of static analysis for AVX/SSE usage sessions
+in x86_64 ELF binaries:
+1. Discovers the main binary and all its dependencies
+2. Identifies SIMD instructions using Capstone disassembly
+3. Builds control flow graphs using angr CFGFast analysis
 
 Usage: python3 avxdump.py <binary_path>
 """
@@ -31,6 +33,13 @@ except ImportError:
     print("Error: Capstone not installed. Install with: pip install capstone")
     sys.exit(1)
 
+try:
+    import angr
+    from angr.analyses import CFGFast
+except ImportError:
+    print("Error: angr not installed. Install with: pip install angr")
+    sys.exit(1)
+
 
 class BinaryAnalyzer:
     """Analyzes ELF binaries and their dependencies."""
@@ -40,6 +49,7 @@ class BinaryAnalyzer:
         self.binary_file = None
         self.libraries = {}  # Dict[str, Dict] - library name -> info dict
         self.simd_instructions = {}  # Dict[str, List] - module -> list of SIMD instructions
+        self.cfg_data = {}  # Dict[str, Dict] - module -> CFG information
         
         # Initialize Capstone disassembler
         self.cs = capstone.Cs(CS_ARCH_X86, CS_MODE_64)
@@ -400,15 +410,238 @@ class BinaryAnalyzer:
         
         return total_simd > 0
     
+    def analyze_cfg_module(self, module_path: str, module_info: Dict) -> Dict:
+        """Analyze control flow graph for a module using angr CFGFast with robust error handling."""
+        cfg_info = {
+            'functions': {},
+            'basic_blocks': {},
+            'edges': [],
+            'entry_points': [],
+            'analysis_success': False,
+            'analysis_method': 'none',
+            'error_details': None
+        }
+        
+        try:
+            print(f"Building CFG for {module_path}...")
+            
+            # Load the binary with angr
+            proj = angr.Project(module_path, auto_load_libs=False)
+            
+            # Try different CFG analysis strategies based on binary size
+            binary_size = os.path.getsize(module_path)
+            print(f"Binary size: {binary_size / (1024*1024):.1f} MB")
+            
+            # Strategy 1: Standard CFGFast with optimized parameters
+            try:
+                print("  Attempting CFGFast with optimized parameters...")
+                cfg = proj.analyses.CFGFast(
+                    force_complete_scan=False,  # Skip exhaustive scanning
+                    resolve_indirect_jumps=False,  # Skip indirect jump resolution
+                    indirect_jump_target_limit=1000,  # Limit indirect jump targets
+                    exclude_sparse_regions=True  # Skip sparse regions
+                )
+                cfg_info['analysis_method'] = 'CFGFast_optimized'
+                cfg_info['analysis_success'] = True
+                print("  CFGFast analysis succeeded!")
+                
+            except Exception as e1:
+                print(f"  CFGFast failed: {e1}")
+                
+                # Strategy 2: CFGFast with minimal parameters for large binaries
+                if binary_size > 10 * 1024 * 1024:  # > 10MB
+                    try:
+                        print("  Attempting CFGFast with minimal parameters...")
+                        cfg = proj.analyses.CFGFast(
+                            force_complete_scan=False,
+                            resolve_indirect_jumps=False,
+                            indirect_jump_target_limit=100,  # Very low limit
+                            exclude_sparse_regions=True
+                        )
+                        cfg_info['analysis_method'] = 'CFGFast_minimal'
+                        cfg_info['analysis_success'] = True
+                        print("  CFGFast minimal analysis succeeded!")
+                        
+                    except Exception as e2:
+                        print(f"  CFGFast minimal failed: {e2}")
+                        
+                        # Strategy 3: Try CFGEmulated for very large binaries
+                        try:
+                            print("  Attempting CFGEmulated (slower but more robust)...")
+                            cfg = proj.analyses.CFGEmulated(
+                                starts=[proj.entry],  # Start from entry point
+                                keep_state=True,
+                                state_add_options=angr.options.unicorn,
+                                context_sensitivity_level=0  # Minimal context sensitivity
+                            )
+                            cfg_info['analysis_method'] = 'CFGEmulated'
+                            cfg_info['analysis_success'] = True
+                            print("  CFGEmulated analysis succeeded!")
+                            
+                        except Exception as e3:
+                            print(f"  CFGEmulated failed: {e3}")
+                            
+                            # Strategy 4: Fallback - extract basic function info from symbols
+                            print("  Attempting fallback: extracting function info from symbols...")
+                            try:
+                                cfg_info = self._extract_functions_from_symbols(proj, module_path)
+                                cfg_info['analysis_method'] = 'symbol_extraction'
+                                cfg_info['analysis_success'] = True
+                                print("  Symbol extraction succeeded!")
+                                return cfg_info
+                            except Exception as e4:
+                                print(f"  Symbol extraction failed: {e4}")
+                                cfg_info['error_details'] = f"All methods failed. CFGFast: {e1}, CFGFast_minimal: {e2}, CFGEmulated: {e3}, Symbols: {e4}"
+                                return cfg_info
+                else:
+                    cfg_info['error_details'] = f"CFGFast failed: {e1}"
+                    return cfg_info
+            
+            # Extract function information
+            for func_addr, func in cfg.functions.items():
+                func_info = {
+                    'address': func_addr,
+                    'name': func.name if func.name else f"sub_{func_addr:x}",
+                    'size': func.size,
+                    'basic_blocks': [],
+                    'entry_block': func.startpoint.addr if func.startpoint else None
+                }
+                
+                # Extract basic blocks for this function
+                for block_addr in func.block_addrs:
+                    # Find the block node in the CFG graph
+                    block_node = None
+                    for node in cfg.graph.nodes():
+                        if hasattr(node, 'addr') and node.addr == block_addr:
+                            block_node = node
+                            break
+                    
+                    if block_node:
+                        block_info = {
+                            'address': block_addr,
+                            'size': block_node.size if hasattr(block_node, 'size') else 0,
+                            'instructions': [],
+                            'successors': [],
+                            'predecessors': []
+                        }
+                        
+                        # Get instruction addresses in this block
+                        if hasattr(block_node, 'instruction_addrs'):
+                            for insn_addr in block_node.instruction_addrs:
+                                block_info['instructions'].append(insn_addr)
+                        
+                        # Get successors and predecessors
+                        for succ in cfg.graph.successors(block_node):
+                            if hasattr(succ, 'addr'):
+                                block_info['successors'].append(succ.addr)
+                        
+                        for pred in cfg.graph.predecessors(block_node):
+                            if hasattr(pred, 'addr'):
+                                block_info['predecessors'].append(pred.addr)
+                        
+                        func_info['basic_blocks'].append(block_info)
+                        cfg_info['basic_blocks'][block_addr] = block_info
+                
+                cfg_info['functions'][func_addr] = func_info
+            
+            # Extract edges between basic blocks
+            for edge in cfg.graph.edges():
+                edge_info = {
+                    'from': edge[0].addr,
+                    'to': edge[1].addr,
+                    'type': 'direct'  # Could be enhanced to detect jump types
+                }
+                cfg_info['edges'].append(edge_info)
+            
+            # Get entry points
+            cfg_info['entry_points'] = list(cfg.functions.keys())
+            
+            print(f"CFG analysis completed for {module_path}:")
+            print(f"  Functions: {len(cfg_info['functions'])}")
+            print(f"  Basic blocks: {len(cfg_info['basic_blocks'])}")
+            print(f"  Edges: {len(cfg_info['edges'])}")
+            
+        except Exception as e:
+            print(f"Error building CFG for {module_path}: {e}")
+            cfg_info['error'] = str(e)
+        
+        return cfg_info
+    
+    def _extract_functions_from_symbols(self, proj, module_path: str) -> Dict:
+        """Fallback method: extract basic function information from symbols when CFG analysis fails."""
+        cfg_info = {
+            'functions': {},
+            'basic_blocks': {},
+            'edges': [],
+            'entry_points': [],
+            'analysis_success': False,
+            'analysis_method': 'symbol_extraction',
+            'error_details': None
+        }
+        
+        try:
+            # Extract function symbols
+            function_count = 0
+            
+            # Get symbols from the binary
+            for symbol in proj.loader.main_object.symbols:
+                if symbol.is_function and symbol.resolvedby is not None:
+                    func_addr = symbol.resolvedby.rebased_addr
+                    func_name = symbol.name if symbol.name else f"sub_{func_addr:x}"
+                    
+                    func_info = {
+                        'address': func_addr,
+                        'name': func_name,
+                        'size': 0,  # Unknown without CFG analysis
+                        'basic_blocks': [],
+                        'entry_block': func_addr
+                    }
+                    
+                    cfg_info['functions'][func_addr] = func_info
+                    function_count += 1
+            
+            # Add entry point
+            if proj.entry:
+                cfg_info['entry_points'] = [proj.entry]
+            
+            print(f"  Extracted {function_count} functions from symbols")
+            cfg_info['analysis_success'] = True
+            
+        except Exception as e:
+            print(f"  Symbol extraction error: {e}")
+            cfg_info['error_details'] = str(e)
+        
+        return cfg_info
+    
+    def analyze_cfg(self) -> bool:
+        """Analyze control flow graphs for all modules."""
+        print("\n=== Building Control Flow Graphs ===")
+        
+        success_count = 0
+        
+        for module_path, module_info in self.libraries.items():
+            cfg_info = self.analyze_cfg_module(module_path, module_info)
+            self.cfg_data[module_path] = cfg_info
+            
+            if cfg_info['analysis_success']:
+                success_count += 1
+        
+        print(f"CFG analysis completed for {success_count}/{len(self.libraries)} modules")
+        
+        return success_count > 0
+    
     def generate_metadata(self) -> Dict:
         """Generate metadata for runtime reconstruction of AVX sessions."""
         metadata = {
             'modules': {},
             'simd_instructions': {},
+            'cfg_data': {},
             'analysis_info': {
                 'binary_path': str(self.binary_path),
                 'total_modules': len(self.libraries),
                 'total_simd_instructions': sum(len(instructions) for instructions in self.simd_instructions.values()),
+                'total_functions': sum(len(cfg.get('functions', {})) for cfg in self.cfg_data.values()),
+                'total_basic_blocks': sum(len(cfg.get('basic_blocks', {})) for cfg in self.cfg_data.values()),
                 'addressing_mode': 'relative',  # All addresses are relative to module base
                 'note': 'All addresses are relative to module base. Runtime must add actual base addresses from /proc/pid/maps.'
             }
@@ -436,6 +669,11 @@ class BinaryAnalyzer:
             module_key = os.path.basename(module_path)
             metadata['simd_instructions'][module_key] = simd_instructions
         
+        # Add CFG data for each module
+        for module_path, cfg_data in self.cfg_data.items():
+            module_key = os.path.basename(module_path)
+            metadata['cfg_data'][module_key] = cfg_data
+        
         return metadata
     
     def save_metadata(self, output_file: str = None) -> str:
@@ -455,12 +693,17 @@ class BinaryAnalyzer:
         return output_file
     
     def print_summary(self):
-        """Print a summary of discovered modules and SIMD instructions."""
+        """Print a summary of discovered modules, SIMD instructions, and CFG data."""
         print("\n=== Analysis Summary ===")
         print(f"Total modules discovered: {len(self.libraries)}")
         
         total_simd = sum(len(instructions) for instructions in self.simd_instructions.values())
         print(f"Total SIMD instructions found: {total_simd}")
+        
+        total_functions = sum(len(cfg.get('functions', {})) for cfg in self.cfg_data.values())
+        total_basic_blocks = sum(len(cfg.get('basic_blocks', {})) for cfg in self.cfg_data.values())
+        print(f"Total functions analyzed: {total_functions}")
+        print(f"Total basic blocks analyzed: {total_basic_blocks}")
         
         print("Note: All addresses are relative to module base for static analysis")
         print("Runtime reconstruction requires adding actual base addresses from /proc/pid/maps")
@@ -469,6 +712,9 @@ class BinaryAnalyzer:
         for module_path, info in self.libraries.items():
             module_type = info['type']
             simd_count = len(self.simd_instructions.get(module_path, []))
+            cfg_info = self.cfg_data.get(module_path, {})
+            func_count = len(cfg_info.get('functions', {}))
+            block_count = len(cfg_info.get('basic_blocks', {}))
             
             if module_type == 'main_binary':
                 print(f"Main Binary: {module_path}")
@@ -482,6 +728,15 @@ class BinaryAnalyzer:
             
             print(f"  Path: {info['path']}")
             print(f"  SIMD Instructions: {simd_count}")
+            print(f"  Functions: {func_count}")
+            print(f"  Basic Blocks: {block_count}")
+            
+            analysis_status = 'Success' if cfg_info.get('analysis_success', False) else 'Failed'
+            analysis_method = cfg_info.get('analysis_method', 'unknown')
+            print(f"  CFG Analysis: {analysis_status} ({analysis_method})")
+            
+            if cfg_info.get('error_details'):
+                print(f"  Error: {cfg_info['error_details'][:100]}...")
             print()
     
     def run_analysis(self, save_metadata: bool = True) -> bool:
@@ -501,6 +756,9 @@ class BinaryAnalyzer:
         if not self.analyze_simd_instructions():
             print("Warning: No SIMD instructions found")
         
+        if not self.analyze_cfg():
+            print("Warning: CFG analysis failed for some modules")
+        
         self.print_summary()
         
         if save_metadata:
@@ -512,11 +770,13 @@ class BinaryAnalyzer:
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="AVX Session Analysis Tool - Step 1: Binary and Library Discovery",
+        description="AVX Session Analysis Tool - Steps 1-3: Binary Discovery, SIMD Analysis, and CFG Building",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-This tool analyzes ELF binaries and discovers all their dependencies,
-gathering load addresses for subsequent AVX/SSE session analysis.
+This tool analyzes ELF binaries and performs the first three steps of AVX/SSE session analysis:
+1. Discovers the main binary and all its dependencies
+2. Identifies SIMD instructions using Capstone disassembly  
+3. Builds control flow graphs using angr CFGFast analysis
 
 Example usage:
   python3 avxdump.py /usr/bin/ls
