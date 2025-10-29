@@ -13,6 +13,7 @@ Usage: python3 avxdump.py <binary_path>
 
 import sys
 import os
+import struct
 import subprocess
 import argparse
 from pathlib import Path
@@ -1590,7 +1591,33 @@ class BinaryAnalyzer:
             json.dump(metadata, f, indent=2)
         
         print(f"Metadata saved to: {output_file}")
+
+        # Also emit per-module binary .avxdump and minimal .avxdump.json files
+        self._save_per_module_binary_metadata()
         return output_file
+
+    def _save_per_module_binary_metadata(self) -> None:
+        """Emit per-module .avxdump (binary) and minimal .avxdump.json files.
+        - .avxdump: binary records of 16 bytes: [start(uint64_le), end(uint64_le)]
+        - .avxdump.json: minimal JSON array of {start_address,end_address}
+        Sessions are sorted by start address before emitting.
+        """
+        import json
+
+        for module_path, sessions in self.avx_sessions.items():
+            module_name = os.path.basename(module_path)
+
+            # Sort sessions by start address
+            sorted_sessions = sorted(sessions, key=lambda s: s['start_address'])
+
+            # Write binary .avxdump file
+            bin_path = f"{module_name}.avxdump"
+            with open(bin_path, 'wb') as bf:
+                for s in sorted_sessions:
+                    start_addr = int(s['start_address']) & 0xFFFFFFFFFFFFFFFF
+                    end_addr = int(s['end_address']) & 0xFFFFFFFFFFFFFFFF
+                    bf.write(struct.pack('<QQ', start_addr, end_addr))
+            print(f"Binary sessions saved to: {bin_path}")
     
     def print_summary(self):
         """Print a summary of discovered modules, SIMD instructions, and CFG data."""
