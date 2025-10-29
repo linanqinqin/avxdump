@@ -694,6 +694,109 @@ class BinaryAnalyzer:
         
         return total_sessions > 0
     
+    def analyze_simd_simple(self) -> bool:
+        """Simple AVX session detection: any function with SIMD instructions is an AVX session."""
+        print("\n=== Performing Simple AVX Session Detection ===")
+        
+        self.avx_sessions = {}
+        self.simple_mode_functions_with_simd = {}  # Track functions with SIMD per module
+        
+        for module_path, cfg_data in self.cfg_data.items():
+            if not cfg_data.get('analysis_success', False):
+                print(f"Skipping {module_path} - CFG analysis failed")
+                continue
+                
+            print(f"Analyzing simple sessions for {module_path}...")
+            module_sessions, functions_with_simd = self._analyze_module_simple(module_path, cfg_data)
+            self.avx_sessions[module_path] = module_sessions
+            self.simple_mode_functions_with_simd[module_path] = functions_with_simd
+            
+            total_sessions = len(module_sessions)
+            print(f"Found {total_sessions} AVX sessions in {module_path}")
+        
+        total_sessions = sum(len(sessions) for sessions in self.avx_sessions.values())
+        total_functions_with_simd = sum(functions_with_simd for functions_with_simd in self.simple_mode_functions_with_simd.values())
+        print(f"Total AVX sessions found: {total_sessions}")
+        print(f"Total functions with SIMD instructions: {total_functions_with_simd}")
+        
+        return total_sessions > 0
+    
+    def _analyze_module_simple(self, module_path: str, cfg_data: Dict) -> Tuple[List[Dict], int]:
+        """Simple analysis: any function with SIMD instructions is an AVX session."""
+        sessions = []
+        
+        # Get SIMD instructions for this module
+        simd_instructions = self.simd_instructions.get(module_path, [])
+        if not simd_instructions:
+            return sessions, 0
+        
+        # Calculate base offset for PIE binaries
+        base_offset = self._calculate_base_offset(cfg_data)
+        
+        # Group SIMD instructions by function using CFG data
+        func_simd_instructions = self._group_simd_by_function(simd_instructions, cfg_data, base_offset)
+        
+        functions_with_simd = len(func_simd_instructions)
+        print(f"Functions with SIMD instructions: {functions_with_simd}")
+        
+        # Create one session per function that has SIMD instructions
+        for func_addr, func_simd_insns in func_simd_instructions.items():
+            if not func_simd_insns:
+                continue
+            
+            # Get function info from CFG data (if available)
+            func_info = cfg_data['functions'].get(func_addr, {})
+            func_name = func_info.get('name', f'func_0x{func_addr:x}')
+            func_size = func_info.get('size', 0)
+            
+            # Check if this is an orphan session (no function info)
+            is_orphan = func_addr not in cfg_data['functions']
+            if is_orphan:
+                func_name = f'orphan_0x{func_addr:x}'
+                func_size = 0
+            
+            # Sort SIMD instructions by address
+            func_simd_insns.sort(key=lambda x: x['address'])
+            
+            # Session spans from first to last instruction in the function
+            # Use function boundaries if available, otherwise use instruction boundaries
+            if func_size > 0:
+                session_start = func_addr
+                session_end = func_addr + func_size - 1  # Inclusive end address
+            else:
+                # Fallback: use instruction boundaries
+                session_start = func_simd_insns[0]['address'] + base_offset
+                session_end = func_simd_insns[-1]['address'] + base_offset
+            
+            # Collect all SIMD instructions in this function
+            session_instructions = []
+            for insn in func_simd_insns:
+                session_instructions.append({
+                    'address': insn['address'] + base_offset,
+                    'mnemonic': insn['mnemonic'],
+                    'operands': insn['operands'],
+                    'opcode': insn['opcode'],
+                    'regs_read': insn['regs_read'],
+                    'regs_write': insn['regs_write']
+                })
+            
+            session = {
+                'start_address': session_start,
+                'end_address': session_end,
+                'function_name': func_name,
+                'function_address': func_addr,
+                'instructions': session_instructions,
+                'instruction_count': len(session_instructions),
+                'detection_method': 'simple_function_based'
+            }
+            
+            sessions.append(session)
+            
+            print(f"  Function {func_name} (0x{func_addr:x}): {len(session_instructions)} SIMD instructions")
+            print(f"    Session: 0x{session_start:x} - 0x{session_end:x}")
+        
+        return sessions, functions_with_simd
+    
     def _analyze_module_liveness(self, module_path: str, cfg_data: Dict) -> List[Dict]:
         """Analyze liveness for a single module."""
         sessions = []
@@ -737,30 +840,13 @@ class BinaryAnalyzer:
         """Group SIMD instructions by function."""
         func_simd = {}
         
-        print(f"\n=== DEBUG: Grouping SIMD by Function ===")
-        print(f"SIMD instructions: {len(simd_instructions)}")
-        print(f"CFG data keys: {list(cfg_data.keys())}")
-        
         functions = cfg_data.get('functions', [])
-        print(f"Functions type: {type(functions)}, count: {len(functions)}")
         
-        if functions and isinstance(functions, list):
-            print(f"First function: {functions[0]}")
-        
-        # Debug address ranges
-        print(f"\nFirst 5 SIMD instruction addresses:")
-        for i, insn in enumerate(simd_instructions[:5]):
-            print(f"  {i}: 0x{insn['address']:08x}")
-        
-        if isinstance(functions, dict):
-            print(f"\nFirst 5 function address ranges:")
-            for i, (func_addr, func_info) in enumerate(list(functions.items())[:5]):
-                func_start = func_info['address']
-                func_end = func_start + func_info.get('size', 0)
-                print(f"  {i}: 0x{func_start:08x} - 0x{func_end:08x}")
-        
+        # Track unassigned instructions
+        unassigned_instructions = []
         for simd_insn in simd_instructions:
             insn_addr = simd_insn['address'] + base_offset  # Normalize address
+            assigned = False
             
             # Find which function contains this instruction
             if isinstance(functions, dict):
@@ -773,6 +859,7 @@ class BinaryAnalyzer:
                         if func_addr not in func_simd:
                             func_simd[func_addr] = []
                         func_simd[func_addr].append(simd_insn)
+                        assigned = True
                         break
             elif isinstance(functions, list):
                 # Functions stored as list
@@ -785,13 +872,87 @@ class BinaryAnalyzer:
                         if func_addr not in func_simd:
                             func_simd[func_addr] = []
                         func_simd[func_addr].append(simd_insn)
+                        assigned = True
                         break
+            
+            # Collect unassigned instructions
+            if not assigned:
+                unassigned_instructions.append(simd_insn)
+        
+        # Create orphan sessions for unassigned instructions
+        if unassigned_instructions:
+            print(f"Creating orphan sessions for {len(unassigned_instructions)} unassigned SIMD instructions")
+            # Use empirical threshold based on function span analysis (95th percentile)
+            threshold = 1602  # bytes - covers 95% of function spans
+            
+            # Group unassigned instructions using distance-based clustering
+            orphan_groups = self._cluster_instructions_by_distance(unassigned_instructions, base_offset, threshold)
+            
+            print(f"  Clustered into {len(orphan_groups)} groups using {threshold} byte threshold")
+            
+            for i, group in enumerate(orphan_groups):
+                if group:
+                    orphan_addr = group[0]['address'] + base_offset
+                    func_simd[orphan_addr] = group
+                    
+                    # Show cluster details
+                    if len(group) > 1:
+                        first_addr = group[0]['address'] + base_offset
+                        last_addr = group[-1]['address'] + base_offset
+                        span = last_addr - first_addr
+                        print(f"    Group {i+1}: {len(group)} instructions, span: {span} bytes (0x{first_addr:x}-0x{last_addr:x})")
+                    else:
+                        print(f"    Group {i+1}: {len(group)} instruction (singleton)")
         
         print(f"Functions with SIMD: {len(func_simd)}")
         for func_addr, insns in func_simd.items():
             print(f"  Function 0x{func_addr:x}: {len(insns)} SIMD instructions")
         
         return func_simd
+    
+    def _cluster_instructions_by_distance(self, instructions: List[Dict], base_offset: int, threshold: int) -> List[List[Dict]]:
+        """
+        Cluster SIMD instructions by address distance using a simple clustering algorithm.
+        
+        Args:
+            instructions: List of SIMD instruction dictionaries
+            base_offset: Base address offset for address normalization
+            threshold: Maximum distance between instructions in the same cluster (bytes)
+            
+        Returns:
+            List of instruction groups (clusters)
+        """
+        if not instructions:
+            return []
+        
+        # Sort instructions by address
+        sorted_instructions = sorted(instructions, key=lambda x: x['address'])
+        
+        clusters = []
+        current_cluster = [sorted_instructions[0]]
+        
+        for i in range(1, len(sorted_instructions)):
+            current_insn = sorted_instructions[i]
+            prev_insn = sorted_instructions[i-1]
+            
+            # Calculate distance between consecutive instructions
+            current_addr = current_insn['address'] + base_offset
+            prev_addr = prev_insn['address'] + base_offset
+            distance = current_addr - prev_addr
+            
+            if distance <= threshold:
+                # Add to current cluster
+                current_cluster.append(current_insn)
+            else:
+                # Start new cluster
+                clusters.append(current_cluster)
+                current_cluster = [current_insn]
+        
+        # Add the last cluster
+        if current_cluster:
+            clusters.append(current_cluster)
+        
+        return clusters
     
     def _analyze_function_liveness(self, func_addr: int, simd_instructions: List[Dict], cfg_data: Dict, base_offset: int) -> List[Dict]:
         """Analyze liveness for a single function."""
@@ -1444,6 +1605,11 @@ class BinaryAnalyzer:
         print(f"Total functions analyzed: {total_functions}")
         print(f"Total basic blocks analyzed: {total_basic_blocks}")
         
+        # Add simple mode information if available
+        if hasattr(self, 'simple_mode_functions_with_simd') and self.simple_mode_functions_with_simd:
+            total_functions_with_simd = sum(functions_with_simd for functions_with_simd in self.simple_mode_functions_with_simd.values())
+            print(f"Functions identified as AVX sessions (simple mode): {total_functions_with_simd}")
+        
         print("Note: All addresses are relative to module base for static analysis")
         print("Runtime reconstruction requires adding actual base addresses from /proc/pid/maps")
         print()
@@ -1478,7 +1644,7 @@ class BinaryAnalyzer:
                 print(f"  Error: {cfg_info['error_details'][:100]}...")
             print()
     
-    def run_analysis(self, save_metadata: bool = True, force: bool = False, binary_only: bool = False) -> bool:
+    def run_analysis(self, save_metadata: bool = True, force: bool = False, binary_only: bool = False, simple_mode: bool = False) -> bool:
         """Run the complete analysis with enhanced workflow."""
         print(f"Starting AVX session analysis for: {self.binary_path}")
         
@@ -1501,13 +1667,13 @@ class BinaryAnalyzer:
         if target_type == 'library':
             # Library-only analysis
             print("Performing library-only analysis...")
-            return self._analyze_library_only(save_metadata)
+            return self._analyze_library_only(save_metadata, simple_mode)
         else:
             # Binary analysis with dependencies
             print("Performing binary analysis with dependencies...")
-            return self._analyze_binary_with_deps(save_metadata, force, binary_only)
+            return self._analyze_binary_with_deps(save_metadata, force, binary_only, simple_mode)
     
-    def _analyze_library_only(self, save_metadata: bool) -> bool:
+    def _analyze_library_only(self, save_metadata: bool, simple_mode: bool = False) -> bool:
         """Analyze a single library."""
         # Add the library itself to the libraries dict
         lib_info = self.get_library_info(str(self.binary_path))
@@ -1522,11 +1688,17 @@ class BinaryAnalyzer:
         if not self.analyze_simd_instructions():
             print("Warning: No SIMD instructions found")
         
+        # Always do CFG analysis - we need function boundaries for both modes
         if not self.analyze_cfg():
             print("Warning: CFG analysis failed")
         
-        if not self.analyze_simd_liveness():
-            print("Warning: Liveness analysis failed")
+        # Choose analysis method
+        if simple_mode:
+            if not self.analyze_simd_simple():
+                print("Warning: Simple AVX session analysis failed")
+        else:
+            if not self.analyze_simd_liveness():
+                print("Warning: Liveness analysis failed")
         
         self.print_summary()
         
@@ -1535,7 +1707,7 @@ class BinaryAnalyzer:
         
         return True
     
-    def _analyze_binary_with_deps(self, save_metadata: bool, force: bool, binary_only: bool = False) -> bool:
+    def _analyze_binary_with_deps(self, save_metadata: bool, force: bool, binary_only: bool = False, simple_mode: bool = False) -> bool:
         """Analyze binary with dependencies, optionally skipping dependency analysis."""
         if not self.analyze_dependencies():
             print("Error: Failed to analyze dependencies")
@@ -1566,11 +1738,17 @@ class BinaryAnalyzer:
         if not self.analyze_simd_instructions():
             print("Warning: No SIMD instructions found")
         
+        # Always do CFG analysis - we need function boundaries for both modes
         if not self.analyze_cfg():
             print("Warning: CFG analysis failed for some modules")
         
-        if not self.analyze_simd_liveness():
-            print("Warning: Liveness analysis failed")
+        # Choose analysis method
+        if simple_mode:
+            if not self.analyze_simd_simple():
+                print("Warning: Simple AVX session analysis failed")
+        else:
+            if not self.analyze_simd_liveness():
+                print("Warning: Liveness analysis failed")
         
         self.print_summary()
         
@@ -1596,12 +1774,14 @@ Workflow:
 - For libraries: Analyzes only the library itself
 - Skips analysis if metadata file already exists (use -f to force)
 - Use -b to analyze only the main binary (skip dependencies)
+- Use -s for simple function-based AVX session detection (faster, less precise)
 
 Example usage:
   python3 avxdump.py /usr/bin/ls                    # Analyze binary with dependencies
   python3 avxdump.py /lib/x86_64-linux-gnu/libc.so.6  # Analyze library only
   python3 avxdump.py -f /usr/bin/ls                 # Force overwrite existing metadata
   python3 avxdump.py -b /usr/bin/cat                # Analyze only main binary (fast)
+  python3 avxdump.py -s /usr/bin/ls                 # Use simple AVX session detection
         """
     )
     
@@ -1620,12 +1800,15 @@ Example usage:
     parser.add_argument('--no-metadata', action='store_true',
                        help='Skip saving metadata JSON file')
     
+    parser.add_argument('-s', '--simple', action='store_true',
+                       help='Use simple AVX session detection (function-based) instead of complex liveness analysis')
+    
     args = parser.parse_args()
     
     # Create analyzer and run analysis
     analyzer = BinaryAnalyzer(args.target_path)
     
-    success = analyzer.run_analysis(save_metadata=not args.no_metadata, force=args.force, binary_only=args.binary_only)
+    success = analyzer.run_analysis(save_metadata=not args.no_metadata, force=args.force, binary_only=args.binary_only, simple_mode=args.simple)
     
     if success:
         print("Analysis completed successfully!")
