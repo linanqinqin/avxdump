@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("binary", help="Path to ELF binary file")
+    parser.add_argument("-d", "--dump", type=str, default="", 
+                       help="Comma-separated list of outputs to generate: 'func' for funcdump.json")
     return parser.parse_args()
 
 
@@ -353,6 +355,25 @@ def map_functions_to_instructions(functions: list, instructions: list) -> list:
     return result
 
 
+def write_output(binary_path: str, dump_opts: str, output_data: dict, function_data: list) -> None:
+    """Write output files based on dump options.
+    
+    Args:
+        binary_path: Path to the binary file
+        dump_opts: Comma-separated string of output types (e.g., "func")
+        output_data: Dictionary with binary metadata for JSON output
+        function_data: List of function data dictionaries
+    """
+    dump_list = [opt.strip().lower() for opt in dump_opts.split(",") if opt.strip()] if dump_opts else []
+    
+    # Generate funcdump.json if 'func' is specified
+    if "func" in dump_list:
+        output_path = binary_path + ".funcdump.json"
+        with open(output_path, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"Function dump written to: {output_path}", file=sys.stdout)
+
+
 def write_gprdump(gpr_path: str, function_data: list, load_base: int) -> int:
     """Generate <binary>.gprdump for functions with zero SIMD instructions.
 
@@ -459,27 +480,23 @@ def main() -> None:
             functions_with_simd = sum(1 for func in function_data if func["num_simd_insns"] > 0)
             print(f"\t{total_simd_insns} total SIMD instructions \n\t{functions_with_simd} functions with SIMD instructions", file=sys.stdout)
 
-            # Prepare output JSON
-            output = {
-                "binary": os.path.abspath(args.binary),
-                "arch": "x86_64",
-                "type": pie_status,
-                "load_base": hex(load_base),
-                "functions": function_data,
-            }
-            
-            # Write output JSON
-            output_path = args.binary + ".funcdump.json"
-            with open(output_path, "w") as f:
-                json.dump(output, f, indent=2)
-            
-            print(f"\nFunction dump written to: {output_path}", file=sys.stdout)
-
-            # Generate GPR dump
+            # Generate GPR dump (always generated, not controlled by -d)
             gpr_path = args.binary + ".gprdump"
             num_regions = write_gprdump(gpr_path, function_data, load_base)
             print(f"GPR dump written to: {gpr_path} ({num_regions} regions)", file=sys.stdout)
             
+            # Write outputs based on -d option
+            if args.dump:
+                # Prepare output JSON 
+                output = {
+                    "binary": os.path.abspath(args.binary),
+                    "arch": "x86_64",
+                    "type": pie_status,
+                    "load_base": hex(load_base),
+                    "functions": function_data,
+                }
+                write_output(args.binary, args.dump, output, function_data)
+
     except Exception as e:
         print(f"[ERROR] Failed to analyze binary: {e}", file=sys.stderr)
         import traceback
