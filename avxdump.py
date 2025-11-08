@@ -195,7 +195,7 @@ def is_simd_instruction(insn) -> bool:
         "fxsave", "fxrstor",
         "xsave", "xsaveopt", "xsavec", "xsaves",
         "xrstor", "xrstors",
-        "xgetbv", "xsetbv",
+        # "xgetbv", "xsetbv", # these two are control plane, not data
         "vzeroupper", "vzeroall",
         # Logical / special
         "insertps", "ptest", "phminposuw",
@@ -220,6 +220,7 @@ def is_simd_instruction(insn) -> bool:
         "kaddb", "kaddw", "kaddd", "kaddq",
         "kshiftlb", "kshiftlw", "kshiftld", "kshiftlq",
         "kshiftrb", "kshiftrw", "kshiftrd", "kshiftrq",
+        "vpternlogq", "vpternlogd", "vpternlogw", "vpternlogb",
     }
     CAPSTONE_MISSING_MNEMONICS_SUBSTR = {
         "bf16",  # BF16 ops sometimes mid-name
@@ -242,9 +243,18 @@ def is_simd_instruction(insn) -> bool:
     SIMD_REGS = {
         "xmm", "ymm", "zmm", "tmm", "mm",
     }
+    # these might be tagged by capstone as SIMD, but are not
+    NON_SIMD_EXCLUDES = {
+        "pause", "crc32",
+        "prefetcht0", "prefetcht1", "prefetcht2", "prefetchnta",
+        "sfence", "lfence", "mfence",
+    }
 
     mnem = insn["mnemonic"].lower()
     ops = insn["operands"].lower()
+    # check excludes first
+    if mnem in NON_SIMD_EXCLUDES:
+        return False
     # Check if instruction belongs to any SIMD group
     if any(group in insn["groups"] for group in simd_groups):
         return True
@@ -331,6 +341,7 @@ def map_functions_to_instructions(functions: list, instructions: list) -> list:
                 break
             num_insns += 1
             if is_simd_instruction(addr_to_insn[addr]):
+                # print(f"{addr_to_insn[addr]['mnemonic']} {addr_to_insn[addr]['operands']}")
                 num_simd_insns += 1
         # insn_all = [f"{insn['address']:x}\t {insn['mnemonic']} {insn['operands']}".strip() for insn in instructions if start_addr <= insn["address"] < func_end_bound]
         # print(f"Function {func['name']}")
