@@ -180,11 +180,6 @@ def is_simd_instruction(insn) -> bool:
         capstone.x86.X86_GRP_XOP, 
     }
     CAPSTONE_MISSING_MNEMONICS_EXACT = {
-        # Scalar conversions
-        "cvtsi2ss", "cvtsi2sd", "cvtss2sd", "cvtsd2ss",
-        "cvtps2pd", "cvtpd2ps",
-        "cvtdq2ps", "cvtps2dq", "cvttps2dq",
-        "cvtdq2pd", "cvtpd2dq", "cvttpd2dq",
         # Scalar arithmetic & compare
         "addss", "subss", "mulss", "divss", "sqrtss", "minss", "maxss",
         "addsd", "subsd", "mulsd", "divsd", "sqrtsd", "minsd", "maxsd",
@@ -192,35 +187,13 @@ def is_simd_instruction(insn) -> bool:
         "rcpss", "rsqrtss", "roundss", "roundsd",
         # Control / state management
         "ldmxcsr", "stmxcsr",
-        "fxsave", "fxrstor",
-        "xsave", "xsaveopt", "xsavec", "xsaves",
-        "xrstor", "xrstors",
-        # "xgetbv", "xsetbv", # these two are control plane, not data
-        "vzeroupper", "vzeroall",
+        "xgetbv", "xsetbv", # these two are control plane, not data
         # Logical / special
         "insertps", "ptest", "phminposuw",
-        "pcmpestri", "pcmpestrm", "pcmpistri", "pcmpistrm",
         # Data moves and conversions
-        "vmovdqu8", "vmovdqu16", "vmovdqu32", "vmovdqu64",
-        "vpmovqd", "vpmovdb", "vpmovdw", "vpmovwb",
-        "vpmovusdb", "vpmovusdw", "vpmovuswb",
-        "vpextrw", "vextracti64x2", "vextracti32x4",
-        "vextractf32x4", "vextractf64x2",
-        "vpermt2b", "vpermt2w", "vpermt2d", "vpermt2q",
-        "vpermi2b", "vpermi2w", "vpermi2d", "vpermi2q",
-        "vpbroadcastb", "vpbroadcastw", "vpbroadcastd", "vpbroadcastq",
-        "vcvtsi2sd", "vcvtsi2ss", "vcvttsd2usi", "vcvttss2usi",
-        # AVX-512 mask moves/tests 
-        "kmovb", "kmovw", "kmovd", "kmovq",
-        "kortestb", "kortestw", "kortestd", "kortestq",
-        "kandb", "kandw", "kandd", "kandq",
-        "korb", "korw", "kord", "korq",
-        "knotb", "knotw", "knotd", "knotq",
-        "kxorb", "kxorw", "kxord", "kxorq",
-        "kaddb", "kaddw", "kaddd", "kaddq",
-        "kshiftlb", "kshiftlw", "kshiftld", "kshiftlq",
-        "kshiftrb", "kshiftrw", "kshiftrd", "kshiftrq",
-        "vpternlogq", "vpternlogd", "vpternlogw", "vpternlogb",
+        "vpextrw", 
+        # Misc
+        "vdivpd", "vrndscalesd", "vunpcklpd", 
     }
     CAPSTONE_MISSING_MNEMONICS_SUBSTR = {
         "bf16",  # BF16 ops sometimes mid-name
@@ -229,16 +202,26 @@ def is_simd_instruction(insn) -> bool:
         "aes",
         "sha",
         "clmul",
+        "xsave", "xrstor", # Control / state management
     }
     CAPSTONE_MISSING_MNEMONICS_PREFIX = {
         "vpdp",        # VNNI: vpdpbusd, vpdpwssd...
         "vpclmul",     # carry-less multiply
         "vaes", "vsha",# AES/SHA
         "vnn",         # other VNNI-style
-        "vcvtne",      # BF16/FP16 conversions
-        "vpmovm2", "vpmovb2", # mask and mov variants
+        "vcvt", "cvt", # Scalar conversions
+        "vpmov", "vmov", # mask and mov variants
         "vp2intersect" # AVX-512 intersection ops
         "vgather", "vscatter",
+        "vsqrts",
+        "vfm", "vfnm",
+        "vand", "vxor", "vmul", 
+        "vzero", 
+        "vpbroadcast", 
+        "vperm", "vextract", 
+        "vptern", 
+        "kand", "kor", "knot", "kxor", "kadd", "ksub", "kmov", "kshift", # AVX-512 mask moves/tests
+        "pcmp", 
     }
     SIMD_REGS = {
         "xmm", "ymm", "zmm", "tmm", "mm",
