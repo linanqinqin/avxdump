@@ -193,7 +193,7 @@ def is_simd_instruction(insn) -> bool:
         # Data moves and conversions
         "vpextrw", 
         # Misc
-        "vdivpd", "vrndscalesd", "vunpcklpd", 
+        "vrndscalesd", "vpshufb", 
     }
     CAPSTONE_MISSING_MNEMONICS_SUBSTR = {
         "bf16",  # BF16 ops sometimes mid-name
@@ -215,13 +215,14 @@ def is_simd_instruction(insn) -> bool:
         "vgather", "vscatter",
         "vsqrts",
         "vfm", "vfnm",
-        "vand", "vxor", "vmul", 
         "vzero", 
         "vpbroadcast", 
         "vperm", "vextract", 
-        "vptern", 
+        "vptern", "vpalign", 
+        "vadd", "vsub", "vdiv", "vand", "vxor", "vmul", 
+        "vunpck", 
         "kand", "kor", "knot", "kxor", "kadd", "ksub", "kmov", "kshift", # AVX-512 mask moves/tests
-        "pcmp", 
+        "pcmp", "pext", 
     }
     SIMD_REGS = {
         "xmm", "ymm", "zmm", "tmm", "mm",
