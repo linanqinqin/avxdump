@@ -220,8 +220,8 @@ def is_simd_instruction(insn) -> bool:
         "vperm", "vextract", 
         "vptern", "vpalign", 
         "vadd", "vsub", "vdiv", "vand", "vxor", "vmul", 
-        "vunpck", 
-        "kand", "kor", "knot", "kxor", "kadd", "ksub", "kmov", "kshift", # AVX-512 mask moves/tests
+        "vunpck", "valign", "vgather",  
+        "kand", "kor", "knot", "kxor", "kxnor", "kadd", "ksub", "kmov", "kshift", # AVX-512 mask moves/tests
         "pcmp", "pext", 
     }
     SIMD_REGS = {
